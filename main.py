@@ -58,7 +58,20 @@ DEFAULT_NOT_FOUND_TEXT = (
     "刚赞助的话可能要等一两分钟到账，稍后再发「我赞助了」～"
 )
 
-SPONSOR_KEYWORDS = ("赞助", "爱发电", "afdian")
+SPONSOR_KEYWORDS = ("赞助", "爱发电", "afdian", "购买", "拍下")
+
+DEFAULT_UNCLAIMED_TEXT = (
+    "查到一笔 {amount} 元的赞助（订单号 {trade_no}），但留言里没写QQ呢…\n"
+    "让管理员用「/准入 订单 {trade_no} 你的QQ」绑定一下就好啦～"
+)
+
+DEFAULT_CLAIMED_OTHER_TEXT = (
+    "查到最近的赞助订单，但留言里写的QQ不是你哦…\n"
+    "确认一下留言是不是写成了别的号码？确实是你赞助的话，"
+    "把订单号发给我哥哥，让管理员用「/准入 订单 订单号 你的QQ」帮你绑定～"
+)
+
+DEFAULT_APPROVED_TEXT = "我哥哥同意啦！现在可以继续和我玩啦～(๑•̀ㅂ•́)و✧"
 
 DEFAULT_EXPIRED_TEXT = (
     "你的体验时间到啦～想继续和我玩的话，可以再次赞助，"
@@ -86,6 +99,7 @@ class PassStore:
             "blocked": [],
             "remind_day": {},
             "passes": {},
+            "claimed_orders": {},
             "stats": {"gate_total": 0, "sponsor_pass_total": 0, "manual_pass_total": 0},
         }
         os.makedirs(_STATE_DIR, exist_ok=True)
@@ -144,7 +158,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.3.0",
+    "0.4.0",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -164,6 +178,7 @@ class SponsorPassPlugin(Star):
         self._blocked: set = {str(x) for x in (d.get("blocked") or [])}
         self._remind_day: dict = dict(d.get("remind_day") or {})
         self._passes: dict = {str(k): float(v) for k, v in (d.get("passes") or {}).items()}
+        self._claimed_orders: dict = {str(k): str(v) for k, v in (d.get("claimed_orders") or {}).items()}
         self._stats: dict = dict(d.get("stats") or {})
         # 瞬时状态（不落盘）
         self._check_ts: dict = {}  # umo -> 上次赞助校验时间（限频）
@@ -176,6 +191,7 @@ class SponsorPassPlugin(Star):
         self._store.data["blocked"] = sorted(self._blocked)
         self._store.data["remind_day"] = self._remind_day
         self._store.data["passes"] = self._passes
+        self._store.data["claimed_orders"] = self._claimed_orders
         self._store.data["stats"] = self._stats
         self._store.save()
 
@@ -451,32 +467,57 @@ class SponsorPassPlugin(Star):
             )
             return
 
-        order = await self._find_order(sender, user_id, token)
-        if order is None:
+        result = await self._search_orders(sender, user_id, token)
+        matched = result["match"]
+        if matched is None:
+            unclaimed = result["unclaimed"]
+            if unclaimed is not None:
+                # 防呆①：查到订单但留言没写QQ —— 给出订单号并通知管理员绑定
+                amount = unclaimed.get("total_amount", "?")
+                trade_no = unclaimed.get("out_trade_no", "?")
+                event.set_result(
+                    MessageEventResult()
+                    .message(
+                        self._format(self._cfg("unclaimed_text", DEFAULT_UNCLAIMED_TEXT), sender, amount)
+                        .replace("{trade_no}", str(trade_no))
+                    )
+                    .stop_event()
+                )
+                await self._notify_owner(
+                    f"🔔 检测到未备注QQ的赞助订单：¥{amount}，订单号 {trade_no}。\n"
+                    f"对方 QQ {sender} 正在认领。确认后执行：/准入 订单 {trade_no} {sender}"
+                )
+                return
+            if result["other"]:
+                # 防呆②：留言写了号码但不是对方的QQ
+                event.set_result(
+                    MessageEventResult()
+                    .message(self._cfg("claimed_other_text", DEFAULT_CLAIMED_OTHER_TEXT))
+                    .stop_event()
+                )
+                return
             amount = safe_int(self._cfg("min_amount", 5), 5)
             event.set_result(
                 MessageEventResult()
-                .message(self._format(self._cfg("not_found_text", DEFAULT_NOT_FOUND_TEXT), sender)
-                         .replace("{amount}", str(amount)))
+                .message(self._format(self._cfg("not_found_text", DEFAULT_NOT_FOUND_TEXT), sender, amount))
                 .stop_event()
             )
             return
 
-        # 校验通过：发放放行凭证（可带有效期）
-        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0)
-        if expire_days > 0:
-            self._passes[sender] = time.time() + expire_days * 86400
-            validity = f"有效期 {expire_days} 天，到期后再次赞助可以续期哦"
-        else:
-            self._passes[sender] = 0
-            validity = "永久有效"
-        self._bump_stat("sponsor_pass_total")
-        self._persist()
+        order = matched
+        trade_no = str(order.get("out_trade_no", "?"))
+        validity = self._grant_pass(sender, order, source="sponsor")
+        if validity is None:
+            event.set_result(
+                MessageEventResult()
+                .message("查到你的订单啦，但发放凭证时出了点问题（订单可能已被使用），麻烦联系我哥哥处理～")
+                .stop_event()
+            )
+            return
         self._clear_session_state(umo)
         logger.info(f"[sponsor_pass] {umo} 赞助校验通过，已放行（{validity}）")
 
         amount = order.get("total_amount", "?")
-        trade_no = order.get("out_trade_no", "?")
         event.set_result(
             MessageEventResult()
             .message(f"查到啦！感谢老板大气～你已经通过考验，以后随便找我玩！(๑•̀ㅂ•́)و✧（{validity}）")
@@ -486,6 +527,54 @@ class SponsorPassPlugin(Star):
             f"🔔 有人通过爱发电赞助自动通过准入：QQ {sender}，金额 ¥{amount}，"
             f"订单号 {trade_no}（{validity}）"
         )
+
+    @staticmethod
+    def _order_units(order: dict) -> int:
+        """售卖方案按份购买的数量（sku_detail 求和，兼容 dict/字符串/数字），常规赞助记 1 份。"""
+        total = 1
+        try:
+            sku = order.get("sku_detail")
+            if isinstance(sku, str):
+                sku = json.loads(sku)
+            if isinstance(sku, list) and sku:
+                counts = []
+                for item in sku:
+                    if isinstance(item, dict):
+                        c = safe_int(item.get("count", item.get("num", 1)), 1)
+                    elif isinstance(item, (int, float)):
+                        c = safe_int(item, 1)
+                    else:
+                        c = 1
+                    counts.append(max(1, c))
+                total = max(1, sum(counts))
+        except Exception:
+            total = 1
+        return total
+
+    def _grant_pass(self, qq: str, order: dict, source: str = "sponsor"):
+        """发放放行凭证（含核销台账防重复使用）。返回有效期描述；订单已被核销时返回 None。"""
+        trade_no = str(order.get("out_trade_no", ""))
+        if trade_no and trade_no in self._claimed_orders:
+            return None
+        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0)
+        units = self._order_units(order)
+        if expire_days > 0:
+            total_days = expire_days * units
+            self._passes[qq] = time.time() + total_days * 86400
+            validity = f"有效期 {total_days} 天" + (
+                f"（{expire_days} 天 × {units} 份）" if units > 1 else ""
+            ) + "，到期后再次赞助可以续期哦"
+        else:
+            self._passes[qq] = 0
+            validity = "永久有效"
+        if trade_no:
+            self._claimed_orders[trade_no] = qq
+        if source == "sponsor":
+            self._bump_stat("sponsor_pass_total")
+        else:
+            self._bump_stat("manual_pass_total")
+        self._persist()
+        return validity
 
     async def _fetch_order_page(self, host: str, user_id: str, token: str,
                                 page: int, per_page: int) -> dict:
@@ -503,10 +592,19 @@ class SponsorPassPlugin(Star):
                 return await resp.json(content_type=None)
 
     async def _find_order(self, qq: str, user_id: str, token: str):
-        """在最近的订单中查找：状态=交易成功、金额达标、留言含该QQ。"""
+        """兼容入口：只返回与QQ匹配的订单（无匹配返回 None）。"""
+        result = await self._search_orders(qq, user_id, token)
+        return result["match"]
+
+    async def _search_orders(self, qq: str, user_id: str, token: str) -> dict:
+        """扫描最近订单，返回 {match, unclaimed, other}：
+        match=留言含该QQ的有效订单；unclaimed=有效但留言没写任何号码（防呆线索）；
+        other=存在留言写了其他号码的订单。
+        """
         pages = max(1, min(safe_int(self._cfg("check_pages", 3), 3), 10))
         per_page = 50
         min_amount = float(safe_int(self._cfg("min_amount", 5), 5))
+        found = {"match": None, "unclaimed": None, "other": False}
         last_error = None
         for host in AFDIAN_API_HOSTS:
             try:
@@ -519,23 +617,63 @@ class SponsorPassPlugin(Star):
                     for order in orders:
                         try:
                             if int(order.get("status", 0)) != 2:
-                                continue
+                                continue  # 未支付/关闭的订单不参与
                             if float(order.get("total_amount", 0) or 0) < min_amount:
-                                continue
-                            if remark_has_qq(str(order.get("remark") or ""), qq):
-                                return order
+                                continue  # 金额不足
                         except (TypeError, ValueError):
                             continue
+                        trade_no = str(order.get("out_trade_no", ""))
+                        if trade_no and trade_no in self._claimed_orders:
+                            continue  # 已核销过的订单不重复认领
+                        remark = str(order.get("remark") or "")
+                        if remark_has_qq(remark, qq):
+                            found["match"] = order
+                            return found
+                        if any(c.isdigit() for c in remark):
+                            found["other"] = True  # 留言写了号码但不是对方
+                        elif found["unclaimed"] is None:
+                            found["unclaimed"] = order
                     total_count = int(payload.get("total_count", 0) or 0)
                     if page * per_page >= total_count:
-                        return None
-                return None
+                        return found
+                return found
             except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as e:
                 last_error = e
                 logger.warning(f"[sponsor_pass] 查询爱发电订单失败（{host}）: {e}")
                 continue
         if last_error:
             logger.warning(f"[sponsor_pass] 爱发电查询最终失败: {last_error}")
+        return found
+
+    async def _find_order_by_no(self, trade_no: str, user_id: str, token: str):
+        """按订单号精确查询（out_trade_no）。"""
+        params = json.dumps({"out_trade_no": str(trade_no)}, separators=(",", ":"))
+        ts = int(time.time())
+        body = {
+            "user_id": user_id,
+            "params": params,
+            "ts": ts,
+            "sign": afdian_sign(token, user_id, params, ts),
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        last_error = None
+        for host in AFDIAN_API_HOSTS:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(host, json=body, timeout=timeout) as resp:
+                        data = await resp.json(content_type=None)
+                if not isinstance(data, dict) or int(data.get("ec", -1)) != 200:
+                    raise RuntimeError(f"接口返回异常 ec={data.get('ec') if isinstance(data, dict) else data}")
+                for order in (data.get("data") or {}).get("list") or []:
+                    if str(order.get("out_trade_no", "")) == str(trade_no):
+                        return order
+                return None
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as e:
+                last_error = e
+                logger.warning(f"[sponsor_pass] 按订单号查询失败（{host}）: {e}")
+                continue
+        if last_error:
+            logger.warning(f"[sponsor_pass] 按订单号查询最终失败: {last_error}")
         return None
 
     async def _notify_on_gate(self, event: AstrMessageEvent, sender: str, max_rounds: int):
@@ -556,6 +694,20 @@ class SponsorPassPlugin(Star):
             f"🔔 陌生人触发准入：{name}（QQ {sender}）已聊满 {max_rounds} 轮。\n"
             f"放行：/准入 同意 {sender}\n拉黑：/准入 拉黑 {sender}"
         )
+
+    async def _send_to(self, qq_or_umo: str, text: str) -> bool:
+        """主动私聊发送；失败只记日志，不影响主流程。"""
+        target = str(qq_or_umo or "").strip()
+        if not target:
+            return False
+        if ":" not in target:
+            target = f"aiocqhttp:FriendMessage:{target}"
+        try:
+            await self.context.send_message(target, MessageChain().message(text))
+            return True
+        except Exception as e:
+            logger.warning(f"[sponsor_pass] 主动消息发送失败({target}): {e}")
+            return False
 
     async def _notify_owner(self, text: str):
         if not bool(self._cfg("notify_owner", True)):
@@ -587,7 +739,8 @@ class SponsorPassPlugin(Star):
         if action in ("帮助", "help", ""):
             yield event.plain_result(
                 "用法：/准入 同意 <QQ号> [天数] | /准入 移除 <QQ号> | /准入 拉黑 <QQ号> | "
-                "/准入 解黑 <QQ号> | /准入 状态 <QQ号> | /准入 重置 <QQ号> | /准入 统计 | /准入 列表"
+                "/准入 解黑 <QQ号> | /准入 订单 <订单号> <QQ号> | /准入 状态 <QQ号> | "
+                "/准入 重置 <QQ号> | /准入 统计 | /准入 列表"
             )
             return
 
@@ -636,22 +789,32 @@ class SponsorPassPlugin(Star):
             if not qq.isdigit():
                 yield event.plain_result("用法：/准入 同意 <QQ号> [天数]（天数留空=永久）")
                 return
+            if qq in self._blacklist():
+                yield event.plain_result(f"{qq} 在黑名单里，请先执行 /准入 解黑 {qq}")
+                return
             n_days = safe_int(days, 0)
             if n_days > 0:
                 self._passes[qq] = time.time() + n_days * 86400
                 self._bump_stat("manual_pass_total")
                 self._persist()
                 self._clear_state_by_qq(qq)
-                yield event.plain_result(f"好啦，已放行 {qq}（有效期 {n_days} 天）～")
+                validity_text = f"有效期 {n_days} 天"
             else:
                 whitelist.add(qq)
-                if self._save_config_list("whitelist", whitelist):
-                    self._bump_stat("manual_pass_total")
-                    self._persist()
-                    self._clear_state_by_qq(qq)
-                    yield event.plain_result(f"好啦，已永久放行 {qq}～")
-                else:
+                if not self._save_config_list("whitelist", whitelist):
                     yield event.plain_result("保存白名单失败，请查看控制台日志")
+                    return
+                self._bump_stat("manual_pass_total")
+                self._persist()
+                self._clear_state_by_qq(qq)
+                validity_text = "永久有效"
+            # 通知申请人（对方可能还不是好友，发送失败不影响放行）
+            notice = self._format(self._cfg("approved_text", DEFAULT_APPROVED_TEXT), qq)
+            if n_days > 0:
+                notice += f"（有效期 {n_days} 天）"
+            sent = await self._send_to(qq, notice)
+            extra = "，已私聊通知对方" if sent else "（对方暂时收不到私聊，回个消息就行）"
+            yield event.plain_result(f"好啦，已放行 {qq}（{validity_text}）{extra}")
             return
 
         if action in ("移除", "删除", "remove", "del"):
@@ -665,6 +828,52 @@ class SponsorPassPlugin(Star):
                 yield event.plain_result(f"已将 {qq} 移出白名单")
             else:
                 yield event.plain_result("保存白名单失败，请查看控制台日志")
+            return
+
+        if action in ("订单", "order"):
+            # 手动核销：把订单绑定给某个QQ（用于对方忘写QQ/写错QQ的兜底）
+            trade_no, target_qq = qq, days
+            if not trade_no or not target_qq.isdigit():
+                yield event.plain_result("用法：/准入 订单 <订单号> <QQ号>")
+                return
+            user_id = str(self._cfg("afdian_user_id", "") or "").strip()
+            token = str(self._cfg("afdian_token", "") or "").strip()
+            if not user_id or not token:
+                yield event.plain_result("尚未配置爱发电接口（afdian_user_id/afdian_token），无法核验订单")
+                return
+            order = await self._find_order_by_no(trade_no, user_id, token)
+            if order is None:
+                yield event.plain_result(f"没有查到订单 {trade_no}，确认订单号是否正确")
+                return
+            try:
+                if int(order.get("status", 0)) != 2:
+                    yield event.plain_result(f"订单 {trade_no} 还未支付完成（status={order.get('status')}），不能核销")
+                    return
+            except (TypeError, ValueError):
+                pass
+            amount = order.get("total_amount", "?")
+            try:
+                if float(amount or 0) < float(safe_int(self._cfg("min_amount", 5), 5)):
+                    yield event.plain_result(
+                        f"该订单金额 ¥{amount} 低于门槛 ¥{self._cfg('min_amount', 5)}；"
+                        f"如确实要放行请用 /准入 同意 {target_qq}"
+                    )
+                    return
+            except (TypeError, ValueError):
+                pass
+            validity = self._grant_pass(target_qq, order, source="manual")
+            if validity is None:
+                yield event.plain_result(
+                    f"订单 {trade_no} 已被核销过（绑定给 {self._claimed_orders.get(trade_no, '?')}），不能重复使用"
+                )
+                return
+            self._clear_state_by_qq(target_qq)
+            notice = self._format(self._cfg("approved_text", DEFAULT_APPROVED_TEXT), target_qq)
+            if validity != "永久有效":
+                notice += f"（{validity}）"
+            sent = await self._send_to(target_qq, notice)
+            extra = "，已私聊通知对方" if sent else ""
+            yield event.plain_result(f"已核销订单 {trade_no}（¥{amount}）并放行 {target_qq}（{validity}）{extra}")
             return
 
         if action in ("拉黑", "黑名单", "ban"):
@@ -704,7 +913,8 @@ class SponsorPassPlugin(Star):
 
         yield event.plain_result(
             "用法：/准入 同意 <QQ号> [天数] | /准入 移除 <QQ号> | /准入 拉黑 <QQ号> | "
-            "/准入 解黑 <QQ号> | /准入 状态 <QQ号> | /准入 重置 <QQ号> | /准入 统计 | /准入 列表"
+            "/准入 解黑 <QQ号> | /准入 订单 <订单号> <QQ号> | /准入 状态 <QQ号> | "
+            "/准入 重置 <QQ号> | /准入 统计 | /准入 列表"
         )
 
     async def terminate(self):

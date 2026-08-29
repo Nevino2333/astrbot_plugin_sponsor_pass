@@ -287,10 +287,10 @@ check("T13 未配置赞助时赞助声明静默处理", ev.stopped and not ev.re
 
 print("== 赞助校验 ==")
 pl = make_plugin()
-order = {"out_trade_no": "X1", "status": 2, "total_amount": "10.00", "remark": f"QQ123456 赞助"}
+_order = {"out_trade_no": "X1", "status": 2, "total_amount": "10.00", "remark": f"QQ123456 赞助"}
 async def fake_find(qq, uid, token):
-    return order if qq == "123456" else None
-pl._find_order = fake_find
+    return {"match": (_order if qq == "123456" else None), "unclaimed": None, "other": False}
+pl._search_orders = fake_find
 for r in range(7):
     ev = FakeEvent(sender="123456", ts=T0 + r * (W + 10))
     run(HANDLER(pl, ev))
@@ -305,8 +305,8 @@ check("T17 通过后恢复自由对话", not ev.stopped and not ev.results)
 
 pl = make_plugin()
 async def fake_none(qq, uid, token):
-    return None
-pl._find_order = fake_none
+    return {"match": None, "unclaimed": None, "other": False}
+pl._search_orders = fake_none
 for r in range(7):
     ev = FakeEvent(sender="654321", ts=T0 + r * (W + 10))
     run(HANDLER(pl, ev))
@@ -405,8 +405,8 @@ check("T31 重启后轮次状态恢复", pl2._rounds.get("aiocqhttp:FriendMessag
 pl = make_plugin(sponsor_expire_days=30)
 _order30 = {"out_trade_no": "E1", "status": 2, "total_amount": "10.00", "remark": "999999"}
 async def _fake_e(qq, uid, token):
-    return _order30 if qq == "999999" else None
-pl._find_order = _fake_e
+    return {"match": (_order30 if qq == "999999" else None), "unclaimed": None, "other": False}
+pl._search_orders = _fake_e
 for r in range(7):
     ev = FakeEvent(sender="999999", ts=T0 + r * (W + 10))
     run(HANDLER(pl, ev))
@@ -458,6 +458,80 @@ check("T36 重置后重新放行", not ev.stopped and not ev.results and pl._rou
 ev = FakeEvent(sender="8888")
 run(run_cmd(pl, ev, "统计", ""))
 check("T37 统计命令", "准入" in ev.reply_text())
+
+print("== 同意通知与订单防呆 ==")
+pl = make_plugin()
+_sent_to = []
+async def _fake_send(target, text):
+    _sent_to.append((target, text))
+    return True
+pl._send_to = _fake_send
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "同意", "515151"))
+check("T38 同意后私聊通知申请人", any(t == "515151" and "同意" in x for t, x in _sent_to))
+
+pl = make_plugin()
+_orders_u = {"out_trade_no": "UC1", "status": 2, "total_amount": "8.00", "remark": "请喝奶茶"}
+async def _fake_s1(qq, uid, token):
+    return {"match": None, "unclaimed": _orders_u, "other": False}
+pl._search_orders = _fake_s1
+_notified = []
+async def _fake_notify2(text):
+    _notified.append(text)
+pl._notify_owner = _fake_notify2
+for r in range(7):
+    ev = FakeEvent(sender="7777", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="7777", ts=T0 + 99999, text="我赞助了")
+run(HANDLER(pl, ev))
+check("T39a 未备注QQ时给出订单号", "UC1" in ev.reply_text() and "绑定" in ev.reply_text())
+check("T39b 管理员收到绑定提示", any("UC1" in t and "7777" in t for t in _notified))
+
+pl = make_plugin()
+async def _fake_s2(qq, uid, token):
+    return {"match": None, "unclaimed": None, "other": True}
+pl._search_orders = _fake_s2
+for r in range(7):
+    ev = FakeEvent(sender="8282", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="8282", ts=T0 + 99999, text="我赞助了")
+run(HANDLER(pl, ev))
+check("T40 留言写了别的QQ时单独提示", "不是你" in ev.reply_text())
+
+pl = make_plugin(sponsor_expire_days=30)
+_order_p = {"out_trade_no": "P1", "status": 2, "total_amount": "20.00", "remark": "999999",
+            "product_type": 1, "sku_detail": [{"name": "数字内容", "count": 2}]}
+async def _fake_p(qq, uid, token):
+    return {"match": (_order_p if qq == "999999" else None), "unclaimed": None, "other": False}
+pl._search_orders = _fake_p
+for r in range(7):
+    ev = FakeEvent(sender="999999", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="999999", ts=T0 + 99999, text="我购买了")
+run(HANDLER(pl, ev))
+check("T41 商品按份折算有效期(30天x2份)",
+      time.time() + 59 * 86400 < pl._passes.get("999999", 0) <= time.time() + 61 * 86400)
+check("T41b 触发词支持购买", ev.stopped and "60 天" in ev.reply_text())
+
+pl = make_plugin()
+_bind_order = {"out_trade_no": "B9", "status": 2, "total_amount": "9.90", "remark": ""}
+async def _fake_by_no(no, uid, token):
+    return _bind_order if no == "B9" else None
+pl._find_order_by_no = _fake_by_no
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "订单", "B9", "616161"))
+check("T42a 手动核销绑定并发放", pl._passes.get("616161") == 0 and pl._claimed_orders.get("B9") == "616161")
+run(run_cmd(pl, ev, "订单", "B9", "626262"))
+check("T42b 同一订单不能重复核销", "重复使用" in ev.reply_text())
+
+pl = make_plugin()
+_unpaid = {"out_trade_no": "U1", "status": 1, "total_amount": "9.90", "remark": ""}
+async def _fake_unpaid(no, uid, token):
+    return _unpaid if no == "U1" else None
+pl._find_order_by_no = _fake_unpaid
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "订单", "U1", "616161"))
+check("T43 未支付订单不能核销", "不能核销" in ev.reply_text())
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
