@@ -100,6 +100,7 @@ class PassStore:
             "remind_day": {},
             "passes": {},
             "claimed_orders": {},
+            "pending": {},
             "stats": {"gate_total": 0, "sponsor_pass_total": 0, "manual_pass_total": 0},
         }
         os.makedirs(_STATE_DIR, exist_ok=True)
@@ -158,7 +159,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.4.1",
+    "0.4.2",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -179,6 +180,7 @@ class SponsorPassPlugin(Star):
         self._remind_day: dict = dict(d.get("remind_day") or {})
         self._passes: dict = {str(k): float(v) for k, v in (d.get("passes") or {}).items()}
         self._claimed_orders: dict = {str(k): str(v) for k, v in (d.get("claimed_orders") or {}).items()}
+        self._pending: dict = {str(k): dict(v) for k, v in (d.get("pending") or {}).items() if isinstance(v, dict)}
         self._stats: dict = dict(d.get("stats") or {})
         # 瞬时状态（不落盘）
         self._check_ts: dict = {}  # umo -> 上次赞助校验时间（限频）
@@ -192,6 +194,7 @@ class SponsorPassPlugin(Star):
         self._store.data["remind_day"] = self._remind_day
         self._store.data["passes"] = self._passes
         self._store.data["claimed_orders"] = self._claimed_orders
+        self._store.data["pending"] = self._pending
         self._store.data["stats"] = self._stats
         self._store.save()
 
@@ -410,6 +413,13 @@ class SponsorPassPlugin(Star):
             .message(self._format(gate_text, sender))
             .stop_event()
         )
+        self._pending[umo] = {
+            "qq": sender,
+            "kind": kind,
+            "created_at": int(time.time()),
+            "last_seen_at": int(time.time()),
+        }
+        self._persist()
         await self._notify_on_gate(event, sender, max_rounds)
 
     async def _on_blocked_message(self, event: AstrMessageEvent, umo: str, sender: str):
@@ -487,7 +497,7 @@ class SponsorPassPlugin(Star):
                 )
                 await self._notify_owner(
                     f"🔔 检测到未备注QQ的赞助订单：¥{amount}，订单号 {trade_no}。\n"
-                    f"对方 QQ {sender} 正在认领。确认后执行：/准入 订单 {trade_no} {sender}"
+                    f"对方 QQ {sender} 正在认领。确认后执行：/准入 订单 {trade_no} {sender}", event=event
                 )
                 return
             if result["other"]:
@@ -527,7 +537,7 @@ class SponsorPassPlugin(Star):
         )
         await self._notify_owner(
             f"🔔 有人通过爱发电赞助自动通过准入：QQ {sender}，金额 ¥{amount}，"
-            f"订单号 {trade_no}（{validity}）"
+            f"订单号 {trade_no}（{validity}）", event=event
         )
 
     @staticmethod
@@ -692,26 +702,53 @@ class SponsorPassPlugin(Star):
             name = event.get_sender_name()
         except Exception:
             name = ""
-        await self._notify_owner(
+        sent = await self._notify_owner(
             f"🔔 陌生人触发准入：{name}（QQ {sender}）已聊满 {max_rounds} 轮。\n"
-            f"放行：/准入 同意 {sender}\n拉黑：/准入 拉黑 {sender}"
+            f"放行：/准入 同意 {sender}\n拉黑：/准入 拉黑 {sender}", event=event
         )
+        if not sent:
+            self._remind_day.pop("gate_notice:" + umo, None)
+            self._persist()
 
-    async def _send_to(self, qq_or_umo: str, text: str) -> bool:
-        """主动私聊发送；失败只记日志，不影响主流程。"""
+    async def _send_private_via_event(self, event: AstrMessageEvent, qq: str, text: str) -> bool:
+        """优先复用当前 aiocqhttp bot 直发，避免统一会话路由不支持主动私聊。"""
+        try:
+            bot = getattr(event, "bot", None)
+            sender = getattr(bot, "send_private_msg", None)
+            if sender is not None:
+                result = sender(user_id=int(qq), message=text)
+                if hasattr(result, "__await__"):
+                    await result
+                return True
+            api = getattr(bot, "api", None)
+            call_action = getattr(api, "call_action", None)
+            if call_action is not None:
+                result = call_action("send_private_msg", user_id=int(qq), message=text)
+                if hasattr(result, "__await__"):
+                    await result
+                return True
+        except Exception as e:
+            logger.warning(f"[sponsor_pass] 当前 bot 私聊发送失败({qq}): {e}")
+        return False
+
+    async def _send_to(self, qq_or_umo: str, text: str, event: AstrMessageEvent = None) -> bool:
+        """主动私聊发送：当前事件 bot 直发优先，context 路由兜底。"""
         target = str(qq_or_umo or "").strip()
         if not target:
             return False
-        if ":" not in target:
-            target = f"aiocqhttp:FriendMessage:{target}"
+        qq = target.rsplit(":", 1)[-1] if ":" in target else target
+        if qq.isdigit() and event is not None:
+            if await self._send_private_via_event(event, qq, text):
+                return True
         try:
-            await self.context.send_message(target, MessageChain().message(text))
+            umo = target if ":" in target else f"aiocqhttp:FriendMessage:{target}"
+            await self.context.send_message(umo, MessageChain().message(text))
             return True
         except Exception as e:
             logger.warning(f"[sponsor_pass] 主动消息发送失败({target}): {e}")
             return False
 
-    async def _notify_owner(self, text: str):
+    async def _notify_owner(self, text: str, event: AstrMessageEvent = None):
         if not bool(self._cfg("notify_owner", True)):
             return
         target = str(self._cfg("notify_target", "") or "").strip()
@@ -719,13 +756,19 @@ class SponsorPassPlugin(Star):
             admins = self._admins()
             target = sorted(admins)[0] if admins else ""
         if not target:
-            return
+            return False
         if ":" not in target:
             target = f"aiocqhttp:FriendMessage:{target}"
+        qq = target.rsplit(":", 1)[-1]
+        if event is not None and qq.isdigit():
+            if await self._send_private_via_event(event, qq, text):
+                return True
         try:
             await self.context.send_message(target, MessageChain().message(text))
+            return True
         except Exception as e:
-            logger.warning(f"[sponsor_pass] 通知管理员失败: {e}")
+            logger.warning(f"[sponsor_pass] 通知管理员失败({target}): {e}")
+            return False
 
     # ---------------- 管理命令 ----------------
 
@@ -798,7 +841,6 @@ class SponsorPassPlugin(Star):
             if n_days > 0:
                 self._passes[qq] = time.time() + n_days * 86400
                 self._bump_stat("manual_pass_total")
-                self._persist()
                 self._clear_state_by_qq(qq)
                 validity_text = f"有效期 {n_days} 天"
             else:
@@ -807,15 +849,19 @@ class SponsorPassPlugin(Star):
                     yield event.plain_result("保存白名单失败，请查看控制台日志")
                     return
                 self._bump_stat("manual_pass_total")
-                self._persist()
                 self._clear_state_by_qq(qq)
                 validity_text = "永久有效"
+            self._pending = {
+                key: value for key, value in self._pending.items()
+                if str(value.get("qq", "")) != qq
+            }
+            self._persist()
             # 通知申请人（对方可能还不是好友，发送失败不影响放行）
             notice = self._format(self._cfg("approved_text", DEFAULT_APPROVED_TEXT), qq)
             if n_days > 0:
                 notice += f"（有效期 {n_days} 天）"
-            sent = await self._send_to(qq, notice)
-            extra = "，已私聊通知对方" if sent else "（对方暂时收不到私聊，回个消息就行）"
+            sent = await self._send_to(qq, notice, event=event)
+            extra = "，已私聊通知对方" if sent else "；私聊通知发送失败，请让对方主动发消息确认"
             yield event.plain_result(f"好啦，已放行 {qq}（{validity_text}）{extra}")
             return
 
@@ -873,8 +919,8 @@ class SponsorPassPlugin(Star):
             notice = self._format(self._cfg("approved_text", DEFAULT_APPROVED_TEXT), target_qq)
             if validity != "永久有效":
                 notice += f"（{validity}）"
-            sent = await self._send_to(target_qq, notice)
-            extra = "，已私聊通知对方" if sent else ""
+            sent = await self._send_to(target_qq, notice, event=event)
+            extra = "，已私聊通知对方" if sent else "；私聊通知发送失败，请让对方主动发消息确认"
             yield event.plain_result(f"已核销订单 {trade_no}（¥{amount}）并放行 {target_qq}（{validity}）{extra}")
             return
 

@@ -431,7 +431,7 @@ check("T33b 解黑后恢复计数", pl._rounds.get("aiocqhttp:FriendMessage:6666
 
 pl = make_plugin()
 _sent = []
-async def _fake_notify(text):
+async def _fake_notify(text, event=None):
     _sent.append(text)
 pl._notify_owner = _fake_notify
 for r in range(7):
@@ -462,7 +462,7 @@ check("T37 统计命令", "准入" in ev.reply_text())
 print("== 同意通知与订单防呆 ==")
 pl = make_plugin()
 _sent_to = []
-async def _fake_send(target, text):
+async def _fake_send(target, text, event=None):
     _sent_to.append((target, text))
     return True
 pl._send_to = _fake_send
@@ -476,7 +476,7 @@ async def _fake_s1(qq, uid, token):
     return {"match": None, "unclaimed": _orders_u, "other": False}
 pl._search_orders = _fake_s1
 _notified = []
-async def _fake_notify2(text):
+async def _fake_notify2(text, event=None):
     _notified.append(text)
 pl._notify_owner = _fake_notify2
 for r in range(7):
