@@ -158,7 +158,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.4.0",
+    "0.4.1",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -376,20 +376,22 @@ class SponsorPassPlugin(Star):
             await self._on_blocked_message(event, umo, sender)
             return
 
-        # 轮次计数：合并窗口内的连发消息算同一轮
+        # 轮次计数：使用固定窗口起点，窗口内的消息不会刷新起点。
+        # 这样即使对方每隔 round_window-1 秒发一条，也会在窗口结束后进入下一轮，不能无限续杯。
         window = safe_int(self._cfg("round_window", 180), 180)
+        window = max(1, window)
         max_rounds = safe_int(self._cfg("max_rounds", 6), 6)
         msg_ts = self._get_timestamp(event)
-        last_ts = self._round_ts.get(umo)
-        if last_ts is None or (msg_ts - last_ts) > window:
+        window_start = self._round_ts.get(umo)
+        if window_start is None or (msg_ts - window_start) > window:
             count = self._rounds.get(umo, 0) + 1
             self._rounds[umo] = count
+            # 只有开始新轮次时才更新窗口起点；窗口内消息不延长当前轮次。
+            self._round_ts[umo] = msg_ts
             self._persist()
-            # 每开始新的一轮打一条 INFO，方便在日志里确认插件已生效
             logger.info(f"[sponsor_pass] {umo}（{kind}）第 {count}/{max_rounds} 轮放行")
         else:
             count = self._rounds.get(umo, 0)
-        self._round_ts[umo] = msg_ts
 
         if count <= max_rounds:
             return  # 放行给 LLM

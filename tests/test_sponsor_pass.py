@@ -513,6 +513,13 @@ check("T41 商品按份折算有效期(30天x2份)",
       time.time() + 59 * 86400 < pl._passes.get("999999", 0) <= time.time() + 61 * 86400)
 check("T41b 触发词支持购买", ev.stopped and "60 天" in ev.reply_text())
 
+print("== 固定窗口轮次回归 ==")
+pl = make_plugin(max_rounds=6, round_window=180)
+for i in range(13):
+    ev = FakeEvent(sender="9090", ts=T0 + i * 170)
+    run(HANDLER(pl, ev))
+check("T44 每170秒发言不能无限停在一轮", pl._rounds.get("aiocqhttp:FriendMessage:9090") == 7 and "aiocqhttp:FriendMessage:9090" in pl._blocked)
+
 pl = make_plugin()
 _bind_order = {"out_trade_no": "B9", "status": 2, "total_amount": "9.90", "remark": ""}
 async def _fake_by_no(no, uid, token):
