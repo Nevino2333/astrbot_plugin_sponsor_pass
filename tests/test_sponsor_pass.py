@@ -8,6 +8,7 @@ import importlib.util
 import logging
 import os
 import sys
+import tempfile
 import time
 import types
 
@@ -141,6 +142,14 @@ def check(name, cond, extra=""):
 
 
 def make_plugin(**cfg):
+    _STATE_SEQ[0] += 1
+    return _make_plugin_at(os.path.join(_TMP_STATE, "state_%d.json" % _STATE_SEQ[0]), **cfg)
+
+
+def _make_plugin_at(state_path, **cfg):
+    main._STATE_DIR = _TMP_STATE
+    main._STATE_PATH = state_path
+    main._STATE_TMP = state_path + ".tmp"
     conf = _AstrBotConfig(
         enable=True,
         whitelist=[],
@@ -156,6 +165,10 @@ def make_plugin(**cfg):
     )
     conf.update(cfg)
     return main.SponsorPassPlugin(context=None, config=conf)
+
+
+_TMP_STATE = tempfile.mkdtemp(prefix="sp_test_")
+_STATE_SEQ = [0]
 
 
 class _MT:
@@ -283,9 +296,9 @@ for r in range(7):
     run(HANDLER(pl, ev))
 ev = FakeEvent(sender="123456", ts=T0 + 99999, text="我赞助了")
 run(HANDLER(pl, ev))
-check("T14 校验通过加白名单", "123456" in pl._whitelist())
+check("T14 校验通过发放永久凭证", pl._passes.get("123456") == 0)
 check("T15 校验通过回复成功文案", "感谢老板" in ev.reply_text())
-check("T16 校验通过后解除拦截并保存配置", "123456" not in pl._blocked and pl.config.saved >= 1)
+check("T16 校验通过后解除拦截并落盘", "123456" not in pl._blocked and os.path.exists(main._STATE_PATH))
 ev = FakeEvent(sender="123456", ts=T0 + 99999 + 5, text="嗨")
 run(HANDLER(pl, ev))
 check("T17 通过后恢复自由对话", not ev.stopped and not ev.results)
@@ -335,8 +348,8 @@ got = run(pl._find_order(QQ, "uid", "tok"))
 check("T21 主域名失败自动切备用域名", got and got.get("out_trade_no") == "B1")
 
 print("== 管理命令 ==")
-async def run_cmd(pl, ev, action, qq):
-    async for r in main.SponsorPassPlugin.admission(pl, ev, action, qq):
+async def run_cmd(pl, ev, action, qq, days=""):
+    async for r in main.SponsorPassPlugin.admission(pl, ev, action, qq, days):
         ev.results.append(r)
 pl = make_plugin()
 ev = FakeEvent(sender="8888")
@@ -379,6 +392,72 @@ pl = make_plugin()
 ev = FakeEvent(ts=T0, text="")
 run(HANDLER(pl, ev))
 check("T30 空消息体事件不计数", not pl._rounds and not ev.results)
+
+print("== 持久化与高级功能 ==")
+_persist_state = os.path.join(_TMP_STATE, "persist_case.json")
+pl = _make_plugin_at(_persist_state)
+for r in range(3):
+    ev = FakeEvent(sender="5555", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+pl2 = _make_plugin_at(_persist_state)
+check("T31 重启后轮次状态恢复", pl2._rounds.get("aiocqhttp:FriendMessage:5555") == 3)
+
+pl = make_plugin(sponsor_expire_days=30)
+_order30 = {"out_trade_no": "E1", "status": 2, "total_amount": "10.00", "remark": "999999"}
+async def _fake_e(qq, uid, token):
+    return _order30 if qq == "999999" else None
+pl._find_order = _fake_e
+for r in range(7):
+    ev = FakeEvent(sender="999999", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="999999", ts=T0 + 99999, text="我赞助了")
+run(HANDLER(pl, ev))
+check("T32a 有效期凭证已发放", 0 < pl._passes.get("999999", 0) <= time.time() + 31 * 86400)
+pl._passes["999999"] = time.time() - 10
+ev = FakeEvent(sender="999999", ts=T0 + 99999 + 10)
+run(HANDLER(pl, ev))
+check("T32b 到期自动出列并提示", "体验时间到啦" in ev.reply_text() and "999999" not in pl._passes)
+
+pl = make_plugin()
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "拉黑", "6666"))
+ev = FakeEvent(sender="6666", ts=T0)
+run(HANDLER(pl, ev))
+check("T33a 拉黑后静默拦截", ev.stopped and not ev.results)
+run(run_cmd(pl, ev, "解黑", "6666"))
+ev = FakeEvent(sender="6666", ts=T0 + 5)
+run(HANDLER(pl, ev))
+check("T33b 解黑后恢复计数", pl._rounds.get("aiocqhttp:FriendMessage:6666") == 1 and not ev.stopped)
+
+pl = make_plugin()
+_sent = []
+async def _fake_notify(text):
+    _sent.append(text)
+pl._notify_owner = _fake_notify
+for r in range(7):
+    ev = FakeEvent(sender="1212", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+check("T34 触发门槛通知管理员", len(_sent) == 1 and "1212" in _sent[0])
+
+pl = make_plugin()
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "同意", "3131", "7"))
+check("T35 同意可指定天数", 0 < pl._passes.get("3131", 0) <= time.time() + 8 * 86400 and "3131" not in pl._whitelist())
+
+pl = make_plugin()
+for r in range(7):
+    ev = FakeEvent(sender="1414", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+check("T36a 已进入拦截态", "aiocqhttp:FriendMessage:1414" in pl._blocked)
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "重置", "1414"))
+ev = FakeEvent(sender="1414", ts=T0 + 99999)
+run(HANDLER(pl, ev))
+check("T36 重置后重新放行", not ev.stopped and not ev.results and pl._rounds.get("aiocqhttp:FriendMessage:1414") == 1)
+
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "统计", ""))
+check("T37 统计命令", "准入" in ev.reply_text())
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

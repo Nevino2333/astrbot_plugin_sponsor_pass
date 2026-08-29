@@ -27,6 +27,29 @@
     "type": "bool",
     "default": true
   },
+  "blacklist": {
+    "description": "黑名单QQ号（无条件静默拦截，/准入 拉黑 自动维护）",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "sponsor_expire_days": {
+    "description": "赞助放行的有效天数（0=永久有效；到期后需再次赞助续期）",
+    "type": "int",
+    "default": 0
+  },
+  "notify_on_gate": {
+    "description": "陌生人触发准入门槛时私聊通知管理员（每人每天最多一次）",
+    "type": "bool",
+    "default": true
+  },
+  "expired_text": {
+    "description": "放行凭证到期后的提示文案",
+    "type": "string",
+    "default": "你的体验时间到啦～想继续和我玩的话，可以再次赞助，或者让我哥哥同意哦（已赞助过的话直接发「我赞助了」我再帮你查查）"
+  },
   "gate_text": {
     "description": "达到轮数上限后的提示文案（占位符：{url} 爱发电链接，{qq} 对方QQ）",
     "type": "string",

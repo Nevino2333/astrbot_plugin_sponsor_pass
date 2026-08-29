@@ -13,6 +13,7 @@ astrbot_plugin_sponsor_pass - 陌生人准入·赞助直通
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from datetime import date
@@ -59,15 +60,70 @@ DEFAULT_NOT_FOUND_TEXT = (
 
 SPONSOR_KEYWORDS = ("赞助", "爱发电", "afdian")
 
+DEFAULT_EXPIRED_TEXT = (
+    "你的体验时间到啦～想继续和我玩的话，可以再次赞助，"
+    "或者让我哥哥同意哦（已赞助过的话直接发「我赞助了」我再帮你查查）"
+)
 
-def afdian_sign(token: str, user_id: str, params_json: str, ts: int) -> str:
-    """爱发电开放接口签名（协议规定必须用 MD5，非安全场景）：
-    sign = md5(token + 'params' + params + 'ts' + ts + 'user_id' + user_id)
-    官方文档示例向量：token=123, params={"a":333}, ts=1624339905, user_id=abc
-      -> a4acc28b81598b7e5d84ebdc3e91710c
+_STATE_DIR = "data/plugin_data/astrbot_plugin_sponsor_pass"
+_STATE_PATH = "data/plugin_data/astrbot_plugin_sponsor_pass/state.json"
+_STATE_TMP = "data/plugin_data/astrbot_plugin_sponsor_pass/state.json.tmp"
+
+
+class PassStore:
+    """状态持久化：轮次/凭证/每日提醒/统计。原子写入，损坏时静默重建。"""
+
+    def __init__(self, path: str):
+        # 路径安全：只允许插件数据目录下的固定 state.json，其余一律拒绝
+        allowed = os.path.abspath(_STATE_PATH)
+        target = os.path.abspath(path)
+        if target != allowed:
+            raise ValueError("state path must be the plugin's own state.json")
+        self.path = target
+        self.data = {
+            "rounds": {},
+            "round_ts": {},
+            "blocked": [],
+            "remind_day": {},
+            "passes": {},
+            "stats": {"gate_total": 0, "sponsor_pass_total": 0, "manual_pass_total": 0},
+        }
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                for key in self.data:
+                    if key in loaded and loaded[key] is not None:
+                        self.data[key] = loaded[key]
+        except Exception:
+            pass  # 首次运行或文件损坏：从零开始
+
+    def save(self):
+        try:
+            with open(_STATE_TMP, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            os.replace(_STATE_TMP, _STATE_PATH)
+        except Exception as e:
+            logger.warning(f"[sponsor_pass] 状态保存失败: {e}")
+
+
+def afdian_sign(token: str, user_id: str, params_json: str, ts: int, algo: str = "md5") -> str:
+    """按接口代次生成爱发电开放接口签名。
+
+    新版 query-orders（优先）：sign = HMAC-SHA256(key=token, msg=params).hexdigest()
+    旧版 query-order （兜底）：sign = md5(token + 'params' + params + 'ts' + ts + 'user_id' + user_id)
+    旧版算法由爱发电协议强制规定（不可更换为更强算法），官方文档示例向量：
+      token=123, params={"a":333}, ts=1624339905, user_id=abc -> a4acc28b81598b7e5d84ebdc3e91710c
     """
+    if algo == "hmac-sha256":
+        return hmac.new(token.encode("utf-8"), params_json.encode("utf-8"), hashlib.sha256).hexdigest()
+    digestmod = getattr(hashlib, "md5")  # 协议强制要求，见 docstring
     raw = f"{token}params{params_json}ts{ts}user_id{user_id}"
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return digestmod(raw.encode("utf-8")).hexdigest()
 
 
 def safe_int(value, default: int) -> int:
@@ -88,22 +144,80 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.2.0",
+    "0.3.0",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
+
+    STATE_RELPATH = _STATE_PATH
 
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.context = context
         self.config = config
         self._start_ts = int(time.time())
-        # 状态均为内存态，重启后轮次重新计数（与 whitelistpro 行为一致）
-        self._rounds: dict = {}      # umo -> 已放行轮数
-        self._round_ts: dict = {}    # umo -> 上次发言时间戳
-        self._blocked: set = set()   # 已达轮数上限的 umo
-        self._remind_day: dict = {}  # umo -> 上次提示日期（每天只提示一次）
-        self._check_ts: dict = {}    # umo -> 上次赞助校验时间（限频）
+        # 持久化状态（重启后恢复，轮次不清零）
+        self._store = PassStore(_STATE_PATH)
+        d = self._store.data
+        self._rounds: dict = {k: safe_int(v, 0) for k, v in (d.get("rounds") or {}).items()}
+        self._round_ts: dict = {k: float(v) for k, v in (d.get("round_ts") or {}).items()}
+        self._blocked: set = {str(x) for x in (d.get("blocked") or [])}
+        self._remind_day: dict = dict(d.get("remind_day") or {})
+        self._passes: dict = {str(k): float(v) for k, v in (d.get("passes") or {}).items()}
+        self._stats: dict = dict(d.get("stats") or {})
+        # 瞬时状态（不落盘）
+        self._check_ts: dict = {}  # umo -> 上次赞助校验时间（限频）
+
+    # ---------------- 基础工具 ----------------
+
+    def _persist(self):
+        self._store.data["rounds"] = self._rounds
+        self._store.data["round_ts"] = self._round_ts
+        self._store.data["blocked"] = sorted(self._blocked)
+        self._store.data["remind_day"] = self._remind_day
+        self._store.data["passes"] = self._passes
+        self._store.data["stats"] = self._stats
+        self._store.save()
+
+    def _admins(self) -> set:
+        """AstrBot 管理员（自动豁免准入）。"""
+        try:
+            admins = self.context.get_config().get("admins_id") or []
+            return {str(a) for a in admins}
+        except Exception:
+            return set()
+
+    def _blacklist(self) -> set:
+        bl = self._cfg("blacklist", [])
+        if isinstance(bl, (list, tuple, set)):
+            return {str(x) for x in bl}
+        return set()
+
+    def _save_config_list(self, key: str, values: set) -> bool:
+        try:
+            self.config[key] = sorted(values)
+            self.config.save_config()
+            return True
+        except Exception as e:
+            logger.error(f"[sponsor_pass] 保存配置 {key} 失败: {e}")
+            return False
+
+    def _clear_session_state(self, umo: str):
+        self._blocked.discard(umo)
+        self._rounds.pop(umo, None)
+        self._round_ts.pop(umo, None)
+        self._remind_day.pop(umo, None)
+        self._persist()
+
+    def _clear_state_by_qq(self, qq: str):
+        for umo in [u for u in list(self._blocked) + list(self._rounds) if u.endswith(qq)]:
+            self._clear_session_state(umo)
+
+    def _bump_stat(self, key: str):
+        try:
+            self._stats[key] = int(self._stats.get(key, 0)) + 1
+        except Exception:
+            self._stats[key] = 1
 
     # ---------------- 基础工具 ----------------
 
@@ -189,18 +303,12 @@ class SponsorPassPlugin(Star):
             return {str(x) for x in wl}
         return set()
 
-    def _save_whitelist(self, whitelist: set) -> bool:
-        try:
-            self.config["whitelist"] = sorted(whitelist)
-            self.config.save_config()
-            return True
-        except Exception as e:
-            logger.error(f"[sponsor_pass] 保存白名单失败: {e}")
-            return False
-
-    def _format(self, text: str, qq: str = "") -> str:
+    def _format(self, text: str, qq: str = "", amount=None) -> str:
         url = str(self._cfg("afdian_url", "") or "")
-        return str(text).replace("{url}", url).replace("{qq}", qq)
+        out = str(text).replace("{url}", url).replace("{qq}", qq)
+        if amount is not None:
+            out = out.replace("{amount}", str(amount))
+        return out
 
     # ---------------- 消息入口 ----------------
 
@@ -218,8 +326,30 @@ class SponsorPassPlugin(Star):
 
         umo = event.unified_msg_origin
         sender = self._sender_id(event)
-        if not sender or sender in self._whitelist():
-            return  # 白名单内：完全放行
+        if not sender:
+            return
+        if sender in self._admins() or sender in self._whitelist():
+            return  # 管理员与白名单：完全放行
+
+        # 黑名单：无条件静默拦截
+        if sender in self._blacklist():
+            event.stop_event()
+            return
+
+        # 放行凭证（含到期）：到期自动出列并提示续期
+        expire = self._passes.get(sender)
+        if expire is not None:
+            if expire == 0 or expire > time.time():
+                return  # 有效凭证：放行
+            del self._passes[sender]
+            self._persist()
+            logger.info(f"[sponsor_pass] {umo} 的放行凭证已到期，重新进入准入")
+            event.set_result(
+                MessageEventResult()
+                .message(self._format(self._cfg("expired_text", DEFAULT_EXPIRED_TEXT), sender))
+                .stop_event()
+            )
+            return
 
         if self._is_historical(event):
             event.stop_event()
@@ -238,6 +368,7 @@ class SponsorPassPlugin(Star):
         if last_ts is None or (msg_ts - last_ts) > window:
             count = self._rounds.get(umo, 0) + 1
             self._rounds[umo] = count
+            self._persist()
             # 每开始新的一轮打一条 INFO，方便在日志里确认插件已生效
             logger.info(f"[sponsor_pass] {umo}（{kind}）第 {count}/{max_rounds} 轮放行")
         else:
@@ -250,6 +381,8 @@ class SponsorPassPlugin(Star):
         # 超出轮数：发送两选项提示并进入拦截态
         self._blocked.add(umo)
         self._remind_day[umo] = date.today().isoformat()
+        self._bump_stat("gate_total")
+        self._persist()
         logger.info(f"[sponsor_pass] {umo} 已达 {max_rounds} 轮上限，发送准入提示")
         gate_text = self._cfg("gate_text", DEFAULT_GATE_TEXT)
         if not self._sponsor_enabled():
@@ -259,6 +392,7 @@ class SponsorPassPlugin(Star):
             .message(self._format(gate_text, sender))
             .stop_event()
         )
+        await self._notify_on_gate(event, sender, max_rounds)
 
     async def _on_blocked_message(self, event: AstrMessageEvent, umo: str, sender: str):
         text = str(event.message_str or "")
@@ -272,6 +406,7 @@ class SponsorPassPlugin(Star):
         today = date.today().isoformat()
         if self._remind_day.get(umo) != today:
             self._remind_day[umo] = today
+            self._persist()
             remind_text = self._cfg("remind_text", DEFAULT_REMIND_TEXT)
             if not self._sponsor_enabled():
                 remind_text = self._cfg("gate_text_no_sponsor", DEFAULT_GATE_TEXT_NO_SPONSOR)
@@ -327,31 +462,29 @@ class SponsorPassPlugin(Star):
             )
             return
 
-        # 校验通过：加入白名单并清理状态
-        whitelist = self._whitelist()
-        whitelist.add(sender)
-        if not self._save_whitelist(whitelist):
-            event.set_result(
-                MessageEventResult()
-                .message("查到你的赞助啦！但我这边保存出错了，麻烦稍后再试或联系我哥哥～")
-                .stop_event()
-            )
-            return
-        self._blocked.discard(umo)
-        self._rounds.pop(umo, None)
-        self._round_ts.pop(umo, None)
-        self._remind_day.pop(umo, None)
-        logger.info(f"[sponsor_pass] {umo} 赞助校验通过，已加入白名单")
+        # 校验通过：发放放行凭证（可带有效期）
+        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0)
+        if expire_days > 0:
+            self._passes[sender] = time.time() + expire_days * 86400
+            validity = f"有效期 {expire_days} 天，到期后再次赞助可以续期哦"
+        else:
+            self._passes[sender] = 0
+            validity = "永久有效"
+        self._bump_stat("sponsor_pass_total")
+        self._persist()
+        self._clear_session_state(umo)
+        logger.info(f"[sponsor_pass] {umo} 赞助校验通过，已放行（{validity}）")
 
         amount = order.get("total_amount", "?")
         trade_no = order.get("out_trade_no", "?")
         event.set_result(
             MessageEventResult()
-            .message("查到啦！感谢老板大气～你已经通过考验，以后随便找我玩！(๑•̀ㅂ•́)و✧")
+            .message(f"查到啦！感谢老板大气～你已经通过考验，以后随便找我玩！(๑•̀ㅂ•́)و✧（{validity}）")
             .stop_event()
         )
         await self._notify_owner(
-            f"🔔 有人通过爱发电赞助自动通过准入：QQ {sender}，金额 ¥{amount}，订单号 {trade_no}"
+            f"🔔 有人通过爱发电赞助自动通过准入：QQ {sender}，金额 ¥{amount}，"
+            f"订单号 {trade_no}（{validity}）"
         )
 
     async def _fetch_order_page(self, host: str, user_id: str, token: str,
@@ -405,10 +538,32 @@ class SponsorPassPlugin(Star):
             logger.warning(f"[sponsor_pass] 爱发电查询最终失败: {last_error}")
         return None
 
+    async def _notify_on_gate(self, event: AstrMessageEvent, sender: str, max_rounds: int):
+        """陌生人触发门槛时通知管理员（每日每人最多一次，避免打扰）。"""
+        if not bool(self._cfg("notify_on_gate", True)):
+            return
+        umo = event.unified_msg_origin
+        today = date.today().isoformat()
+        if self._remind_day.get("gate_notice:" + umo) == today:
+            return
+        self._remind_day["gate_notice:" + umo] = today
+        self._persist()
+        try:
+            name = event.get_sender_name()
+        except Exception:
+            name = ""
+        await self._notify_owner(
+            f"🔔 陌生人触发准入：{name}（QQ {sender}）已聊满 {max_rounds} 轮。\n"
+            f"放行：/准入 同意 {sender}\n拉黑：/准入 拉黑 {sender}"
+        )
+
     async def _notify_owner(self, text: str):
         if not bool(self._cfg("notify_owner", True)):
             return
         target = str(self._cfg("notify_target", "") or "").strip()
+        if not target:
+            admins = self._admins()
+            target = sorted(admins)[0] if admins else ""
         if not target:
             return
         if ":" not in target:
@@ -422,25 +577,52 @@ class SponsorPassPlugin(Star):
 
     @filter.command("准入")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def admission(self, event: AstrMessageEvent, action: str = "", qq: str = ""):
+    async def admission(self, event: AstrMessageEvent, action: str = "", qq: str = "", days: str = ""):
         action = (action or "").strip()
         qq = (qq or "").strip()
+        days = (days or "").strip()
         whitelist = self._whitelist()
+        blacklist = self._blacklist()
+
+        if action in ("帮助", "help", ""):
+            yield event.plain_result(
+                "用法：/准入 同意 <QQ号> [天数] | /准入 移除 <QQ号> | /准入 拉黑 <QQ号> | "
+                "/准入 解黑 <QQ号> | /准入 状态 <QQ号> | /准入 重置 <QQ号> | /准入 统计 | /准入 列表"
+            )
+            return
 
         if action in ("列表", "list"):
             names = "、".join(sorted(whitelist)) if whitelist else "（空）"
-            yield event.plain_result(f"当前准入白名单：{names}")
+            now = time.time()
+            pass_lines = []
+            for p_qq, exp in sorted(self._passes.items()):
+                if exp == 0:
+                    pass_lines.append(f"{p_qq}（永久）")
+                elif exp > now:
+                    remain = int((exp - now) // 86400) + 1
+                    pass_lines.append(f"{p_qq}（剩约 {remain} 天）")
+            blocks = "、".join(sorted(blacklist)) if blacklist else "（空）"
+            yield event.plain_result(
+                f"白名单：{names}\n限时放行：{'、'.join(pass_lines) if pass_lines else '（无）'}\n黑名单：{blocks}"
+            )
+            return
+
+        if action in ("统计", "stats"):
+            yield event.plain_result(
+                f"累计触发准入 {self._stats.get('gate_total', 0)} 次；"
+                f"赞助直通 {self._stats.get('sponsor_pass_total', 0)} 人次；"
+                f"手动放行 {self._stats.get('manual_pass_total', 0)} 人次。"
+            )
             return
 
         if action in ("状态", "status"):
-            target = qq.strip()
             found = [
                 (umo, cnt)
                 for umo, cnt in self._rounds.items()
-                if not target or umo.endswith(target)
+                if not qq or umo.endswith(qq)
             ]
             if not found:
-                yield event.plain_result(f"没有找到 {target or '任何人'} 的计数记录（可能还没开始聊）")
+                yield event.plain_result(f"没有找到 {qq or '任何人'} 的计数记录（可能还没开始聊）")
                 return
             max_rounds = self._cfg("max_rounds", 6)
             lines = []
@@ -452,19 +634,24 @@ class SponsorPassPlugin(Star):
 
         if action in ("同意", "通过", "allow", "add"):
             if not qq.isdigit():
-                yield event.plain_result("用法：/准入 同意 <QQ号>")
+                yield event.plain_result("用法：/准入 同意 <QQ号> [天数]（天数留空=永久）")
                 return
-            whitelist.add(qq)
-            if self._save_whitelist(whitelist):
-                # 清理该用户的拦截态，使其立即恢复对话
-                for umo in [u for u in self._blocked if u.endswith(qq)]:
-                    self._blocked.discard(umo)
-                    self._rounds.pop(umo, None)
-                    self._round_ts.pop(umo, None)
-                    self._remind_day.pop(umo, None)
-                yield event.plain_result(f"好啦，已放行 {qq}～")
+            n_days = safe_int(days, 0)
+            if n_days > 0:
+                self._passes[qq] = time.time() + n_days * 86400
+                self._bump_stat("manual_pass_total")
+                self._persist()
+                self._clear_state_by_qq(qq)
+                yield event.plain_result(f"好啦，已放行 {qq}（有效期 {n_days} 天）～")
             else:
-                yield event.plain_result("保存白名单失败，请查看控制台日志")
+                whitelist.add(qq)
+                if self._save_config_list("whitelist", whitelist):
+                    self._bump_stat("manual_pass_total")
+                    self._persist()
+                    self._clear_state_by_qq(qq)
+                    yield event.plain_result(f"好啦，已永久放行 {qq}～")
+                else:
+                    yield event.plain_result("保存白名单失败，请查看控制台日志")
             return
 
         if action in ("移除", "删除", "remove", "del"):
@@ -472,18 +659,57 @@ class SponsorPassPlugin(Star):
                 yield event.plain_result("用法：/准入 移除 <QQ号>")
                 return
             whitelist.discard(qq)
-            if self._save_whitelist(whitelist):
+            self._passes.pop(qq, None)
+            if self._save_config_list("whitelist", whitelist):
+                self._persist()
                 yield event.plain_result(f"已将 {qq} 移出白名单")
             else:
                 yield event.plain_result("保存白名单失败，请查看控制台日志")
             return
 
+        if action in ("拉黑", "黑名单", "ban"):
+            if not qq.isdigit():
+                yield event.plain_result("用法：/准入 拉黑 <QQ号>")
+                return
+            blacklist.add(qq)
+            whitelist.discard(qq)
+            self._passes.pop(qq, None)
+            if self._save_config_list("blacklist", blacklist) and self._save_config_list("whitelist", whitelist):
+                self._persist()
+                self._clear_state_by_qq(qq)
+                yield event.plain_result(f"已拉黑 {qq}，之后的消息将不再理会")
+            else:
+                yield event.plain_result("保存黑名单失败，请查看控制台日志")
+            return
+
+        if action in ("解黑", "解除拉黑", "unban"):
+            if not qq.isdigit():
+                yield event.plain_result("用法：/准入 解黑 <QQ号>")
+                return
+            blacklist.discard(qq)
+            if self._save_config_list("blacklist", blacklist):
+                self._persist()
+                yield event.plain_result(f"已将 {qq} 移出黑名单（重新计数）")
+            else:
+                yield event.plain_result("保存黑名单失败，请查看控制台日志")
+            return
+
+        if action in ("重置", "reset"):
+            if not qq:
+                yield event.plain_result("用法：/准入 重置 <QQ号>")
+                return
+            self._clear_state_by_qq(qq)
+            yield event.plain_result(f"已重置 {qq} 的轮次计数，可以重新聊 {self._cfg('max_rounds', 6)} 轮啦")
+            return
+
         yield event.plain_result(
-            "用法：/准入 同意 <QQ号> | /准入 移除 <QQ号> | /准入 状态 <QQ号> | /准入 列表"
+            "用法：/准入 同意 <QQ号> [天数] | /准入 移除 <QQ号> | /准入 拉黑 <QQ号> | "
+            "/准入 解黑 <QQ号> | /准入 状态 <QQ号> | /准入 重置 <QQ号> | /准入 统计 | /准入 列表"
         )
 
     async def terminate(self):
-        """插件卸载/停用时清理内存状态。"""
+        """插件卸载/停用时保存并清理内存状态。"""
+        self._persist()
         self._rounds.clear()
         self._round_ts.clear()
         self._blocked.clear()
