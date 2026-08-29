@@ -22,6 +22,11 @@
     "type": "int",
     "default": 180
   },
+  "enable_temp_session": {
+    "description": "临时会话（非好友陌生人）也纳入准入",
+    "type": "bool",
+    "default": true
+  },
   "gate_text": {
     "description": "达到轮数上限后的提示文案（占位符：{url} 爱发电链接，{qq} 对方QQ）",
     "type": "string",

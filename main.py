@@ -88,7 +88,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.1.0",
+    "0.2.0",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -115,11 +115,44 @@ class SponsorPassPlugin(Star):
         return default if value is None else value
 
     @staticmethod
-    def _is_friend_private(event: AstrMessageEvent) -> bool:
+    def _private_kind(event: AstrMessageEvent) -> str:
+        """返回会话类别：friend=好友私聊，temp=临时会话，""=不归本插件管（群聊等）。
+
+        注意 AstrBot 枚举字符串是大写：MessageType.FRIEND_MESSAGE / GROUP_MESSAGE / OTHER_MESSAGE。
+        必须用框架方法 get_message_type()，不要用 str(event.message_obj.type) 猜测。
+        """
         try:
-            return "FriendMessage" in str(event.message_obj.type)
+            name = str(event.get_message_type())
         except Exception:
-            return False
+            return ""
+        if "GROUP_MESSAGE" in name:
+            return ""
+        if "FRIEND_MESSAGE" in name:
+            return "friend"
+        if "OTHER_MESSAGE" in name:
+            return "temp"
+        return ""
+
+    @staticmethod
+    def _is_request_or_notice(event: AstrMessageEvent) -> bool:
+        """好友申请/群邀请/通知等事件：独立放行，交给人际关系等插件处理。
+
+        这类事件在 aiocqhttp 适配器里也被标成 FRIEND_MESSAGE 但消息体为空。
+        """
+        raw = getattr(event.message_obj, "raw_message", None)
+        try:
+            post_type = raw.get("post_type", "") if hasattr(raw, "get") else ""
+        except Exception:
+            post_type = ""
+        if post_type in ("request", "notice"):
+            return True
+        # 兜底：消息链与文本都为空的事件不是正常对话
+        try:
+            if not getattr(event.message_obj, "message", None) and not (event.message_str or "").strip():
+                return True
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _sender_id(event: AstrMessageEvent) -> str:
@@ -175,8 +208,13 @@ class SponsorPassPlugin(Star):
     async def on_message(self, event: AstrMessageEvent):
         if not bool(self._cfg("enable", True)):
             return
-        if not self._is_friend_private(event):
-            return
+        kind = self._private_kind(event)
+        if not kind:
+            return  # 群聊或未知类型：不归本插件管
+        if kind == "temp" and not bool(self._cfg("enable_temp_session", True)):
+            return  # 临时会话不纳入准入
+        if self._is_request_or_notice(event):
+            return  # 好友申请/通知事件：放行，交给人际关系等插件处理
 
         umo = event.unified_msg_origin
         sender = self._sender_id(event)
@@ -200,12 +238,13 @@ class SponsorPassPlugin(Star):
         if last_ts is None or (msg_ts - last_ts) > window:
             count = self._rounds.get(umo, 0) + 1
             self._rounds[umo] = count
+            # 每开始新的一轮打一条 INFO，方便在日志里确认插件已生效
+            logger.info(f"[sponsor_pass] {umo}（{kind}）第 {count}/{max_rounds} 轮放行")
         else:
             count = self._rounds.get(umo, 0)
         self._round_ts[umo] = msg_ts
 
         if count <= max_rounds:
-            logger.debug(f"[sponsor_pass] {umo} 第 {count}/{max_rounds} 轮自由对话")
             return  # 放行给 LLM
 
         # 超出轮数：发送两选项提示并进入拦截态
@@ -393,6 +432,24 @@ class SponsorPassPlugin(Star):
             yield event.plain_result(f"当前准入白名单：{names}")
             return
 
+        if action in ("状态", "status"):
+            target = qq.strip()
+            found = [
+                (umo, cnt)
+                for umo, cnt in self._rounds.items()
+                if not target or umo.endswith(target)
+            ]
+            if not found:
+                yield event.plain_result(f"没有找到 {target or '任何人'} 的计数记录（可能还没开始聊）")
+                return
+            max_rounds = self._cfg("max_rounds", 6)
+            lines = []
+            for umo, cnt in found:
+                state = "已拦截" if umo in self._blocked else "对话中"
+                lines.append(f"{umo}：第 {cnt}/{max_rounds} 轮，{state}")
+            yield event.plain_result("\n".join(lines))
+            return
+
         if action in ("同意", "通过", "allow", "add"):
             if not qq.isdigit():
                 yield event.plain_result("用法：/准入 同意 <QQ号>")
@@ -422,7 +479,7 @@ class SponsorPassPlugin(Star):
             return
 
         yield event.plain_result(
-            "用法：/准入 同意 <QQ号> | /准入 移除 <QQ号> | /准入 列表"
+            "用法：/准入 同意 <QQ号> | /准入 移除 <QQ号> | /准入 状态 <QQ号> | /准入 列表"
         )
 
     async def terminate(self):

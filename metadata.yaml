@@ -16,7 +16,7 @@ desc: |
   特性：轮次按对话轮计数（180 秒合并窗口内连发算一轮）；拦截期每天仅提醒一次；
   同一人赞助校验限频防刷；未配置爱发电时只提示等待同意，不会给出无效入口；
   仅处理好友私聊，不影响群聊。
-version: 0.1.0
+version: 0.2.0
 author: Nevino
 repo: https://github.com/Nevino2333/astrbot_plugin_sponsor_pass
 support_platforms:

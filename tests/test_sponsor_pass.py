@@ -168,20 +168,28 @@ class _MT:
 
 class FakeEvent:
     def __init__(self, sender="10001", text="hi", ts=None,
-                 mtype="MessageType.FriendMessage", umo=None):
+                 mtype="MessageType.FRIEND_MESSAGE", umo=None, raw=None):
         self._sender = str(sender)
         self.message_str = text
         t = int(ts) if ts is not None else int(time.time())
-        self.message_obj = types.SimpleNamespace(type=_MT(mtype), time=t, message=[])
+        self.message_obj = types.SimpleNamespace(
+            type=_MT(mtype), time=t, message=[], raw_message=raw
+        )
         self.unified_msg_origin = umo or f"aiocqhttp:FriendMessage:{sender}"
         self.results = []
         self.stopped = False
+
+    def get_message_type(self):
+        return self.message_obj.type
 
     def get_sender_id(self):
         return self._sender
 
     def set_result(self, r):
         self.results.append(r)
+        # 与真实 AstrBot 一致：结果对象调用 stop_event() 意味着事件停止传播
+        if getattr(r, "stopped", False):
+            self.stopped = True
 
     def stop_event(self):
         self.stopped = True
@@ -243,7 +251,7 @@ check("T08 白名单用户永不拦截", not ev.stopped and not ev.results)
 
 print("== 非好友/历史消息 ==")
 pl = make_plugin()
-ev = FakeEvent(mtype="MessageType.GroupMessage", ts=T0)
+ev = FakeEvent(mtype="MessageType.GROUP_MESSAGE", ts=T0)
 run(HANDLER(pl, ev))
 check("T09 群消息完全忽略", not ev.stopped and not ev.results and not pl._rounds)
 ev = FakeEvent(ts=pl._start_ts - 3600)
@@ -341,6 +349,36 @@ check("T24 /准入 移除", "123456" not in pl._whitelist())
 ev = FakeEvent(sender="8888")
 run(run_cmd(pl, ev, "同意", ""))
 check("T25 参数缺失给用法", "用法" in ev.reply_text())
+
+print("== 请求事件与临时会话 ==")
+pl = make_plugin()
+ev = FakeEvent(ts=T0, raw={"post_type": "request"})
+run(HANDLER(pl, ev))
+check("T26 好友申请事件独立放行不计数", not ev.stopped and not ev.results and not pl._rounds)
+
+pl = make_plugin()
+for r in range(7):
+    ev = FakeEvent(ts=T0 + r * (W + 10), mtype="MessageType.OTHER_MESSAGE")
+    run(HANDLER(pl, ev))
+check("T27 临时会话也纳入准入", ev.stopped and bool(ev.results))
+
+pl = make_plugin(enable_temp_session=False)
+ev = FakeEvent(ts=T0, mtype="MessageType.OTHER_MESSAGE")
+run(HANDLER(pl, ev))
+check("T28 关闭临时会话准入则忽略", not ev.stopped and not ev.results and not pl._rounds)
+
+pl = make_plugin()
+for r in range(3):
+    ev = FakeEvent(sender="7777", ts=T0 + r * (W + 10))
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="8888")
+run(run_cmd(pl, ev, "状态", "7777"))
+check("T29 /准入 状态 查询", "第 3/6 轮" in ev.reply_text())
+
+pl = make_plugin()
+ev = FakeEvent(ts=T0, text="")
+run(HANDLER(pl, ev))
+check("T30 空消息体事件不计数", not pl._rounds and not ev.results)
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
