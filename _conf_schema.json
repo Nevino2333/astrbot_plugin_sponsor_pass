@@ -7,6 +7,9 @@
   "whitelist": {
     "description": "准入白名单QQ号（始终放行、不计数；赞助通过/管理员同意后自动加入）",
     "type": "list",
+    "items": {
+      "type": "string"
+    },
     "default": []
   },
   "max_rounds": {
