@@ -1,0 +1,2 @@
+# aiohttp 已随 AstrBot 提供，此文件保留用于插件市场依赖声明
+aiohttp

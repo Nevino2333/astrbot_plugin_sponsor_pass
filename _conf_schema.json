@@ -1,0 +1,87 @@
+{
+  "enable": {
+    "description": "启用陌生人准入（关闭后本插件不拦截任何消息）",
+    "type": "bool",
+    "default": true
+  },
+  "whitelist": {
+    "description": "准入白名单QQ号（始终放行、不计数；赞助通过/管理员同意后自动加入）",
+    "type": "list",
+    "default": []
+  },
+  "max_rounds": {
+    "description": "免费自由对话轮数（合并窗口内的连发算同一轮），超过后给出两条路",
+    "type": "int",
+    "default": 6
+  },
+  "round_window": {
+    "description": "轮次合并窗口（秒）：窗口内的连续发言算同一轮",
+    "type": "int",
+    "default": 180
+  },
+  "gate_text": {
+    "description": "达到轮数上限后的提示文案（占位符：{url} 爱发电链接，{qq} 对方QQ）",
+    "type": "string",
+    "default": "先聊到这儿啦，我得去问问我哥同不同意～\n不过给你指两条路：\n① 耐心等等，我哥哥点头了就来找你\n② 请我哥哥喝杯奶茶，就能直接通过哦 → {url}\n　（赞助时记得在留言里写上你的QQ：{qq}）\n赞助到账后发一句「我赞助了」，我来帮你查～"
+  },
+  "gate_text_no_sponsor": {
+    "description": "未启用赞助直通时（或赞助配置不完整时）的提示文案",
+    "type": "string",
+    "default": "先聊到这儿啦，我得去问问我哥 他同意了咱再接着聊～"
+  },
+  "remind_text": {
+    "description": "拦截期间每天一次的提醒文案（占位符同上）",
+    "type": "string",
+    "default": "我还在等我哥哥的答复呢～也可以请我哥哥喝杯奶茶直接通过哦 → {url}（留言备注QQ：{qq}）"
+  },
+  "not_found_text": {
+    "description": "赞助查不到时的提示文案（占位符：{qq} {amount} {url}）",
+    "type": "string",
+    "default": "呜，还没查到你的赞助记录呢…确认一下：\n① 爱发电留言里写了QQ {qq} 嘛？\n② 金额满 {amount} 元了嘛？\n刚赞助的话可能要等一两分钟到账，稍后再发「我赞助了」～"
+  },
+  "enable_sponsor": {
+    "description": "启用爱发电赞助直通（关闭后拦截文案不含赞助入口；需配置 afdian_user_id 和 afdian_token）",
+    "type": "bool",
+    "default": true
+  },
+  "afdian_url": {
+    "description": "你的爱发电主页链接，如 https://afdian.com/a/xxx",
+    "type": "string",
+    "default": ""
+  },
+  "afdian_user_id": {
+    "description": "爱发电开发者 user_id（爱发电后台-开发者设置获取）",
+    "type": "string",
+    "default": ""
+  },
+  "afdian_token": {
+    "description": "爱发电开放接口 token（同上获取，注意保密）",
+    "type": "string",
+    "default": ""
+  },
+  "min_amount": {
+    "description": "有效赞助的最低金额（元，按实付金额算）",
+    "type": "int",
+    "default": 5
+  },
+  "check_pages": {
+    "description": "校验时最多翻查的订单页数（每页50条，按时间倒序）",
+    "type": "int",
+    "default": 3
+  },
+  "check_cooldown": {
+    "description": "同一个人两次赞助校验的最小间隔（秒），防止刷接口",
+    "type": "int",
+    "default": 300
+  },
+  "notify_owner": {
+    "description": "有人通过赞助自动通过时通知管理员",
+    "type": "bool",
+    "default": true
+  },
+  "notify_target": {
+    "description": "管理员QQ号（会自动拼成好友私聊会话）；也可直接填完整会话字符串",
+    "type": "string",
+    "default": ""
+  }
+}
