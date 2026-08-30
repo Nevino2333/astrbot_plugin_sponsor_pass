@@ -17,7 +17,7 @@ import os
 import re
 import time
 from decimal import Decimal, InvalidOperation
-from datetime import date
+from datetime import date, datetime
 from sys import maxsize
 
 import aiohttp
@@ -60,6 +60,26 @@ DEFAULT_NOT_FOUND_TEXT = (
 )
 
 SPONSOR_KEYWORDS = ("赞助", "爱发电", "afdian", "购买", "拍下")
+ORDER_CODE_PREFIXES = ("订单码", "订单号", "兑换码", "兑换")
+ORDER_CODE_PATTERN = re.compile(r"^[0-9]{20,32}$")
+
+
+def _looks_like_afdian_order_code(value: str) -> bool:
+    """只接受爱发电常见的长数字订单号，且前八位必须是合法日期。"""
+    if not ORDER_CODE_PATTERN.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value[:8], "%Y%m%d")
+    except ValueError:
+        return False
+    return value.startswith("20")
+
+DEFAULT_ORDER_CODE_INVALID_TEXT = "订单码格式不对哦，请发送「订单码: 爱发电订单号」～"
+DEFAULT_ORDER_CODE_CHECKING_TEXT = "收到啦，正在核验订单，请不要重复发送或重复购买～"
+DEFAULT_ORDER_CODE_NOT_FOUND_TEXT = "没有查到这个订单码对应的已支付订单，请确认订单号是否完整～"
+DEFAULT_ORDER_CODE_USED_TEXT = "这个订单码已经兑换过了，不能重复使用哦～"
+DEFAULT_ORDER_CODE_SUCCESS_TEXT = "订单核验成功！你已经通过啦，之后可以继续和我聊天～"
+DEFAULT_ORDER_CODE_ERROR_TEXT = "订单查询服务暂时不可用，请稍后再试，不要重复付款～"
 
 DEFAULT_UNCLAIMED_TEXT = (
     "查到一笔 {amount} 元的赞助（订单号 {trade_no}），但留言里没写QQ呢…\n"
@@ -161,7 +181,30 @@ def safe_int(value, default: int, minimum=None, maximum=None) -> int:
     return result
 
 
-def safe_amount(value, default: Decimal = Decimal("0")) -> Decimal:
+def parse_order_code(text: str):
+    """只解析带明确前缀的订单码；裸数字/QQ号/金额永远返回 None。"""
+    value = str(text or "").strip()
+    if not value:
+        return None
+    # 纯数字长订单号也支持，但必须像爱发电订单号，不接受普通数字
+    if value.isdigit() and _looks_like_afdian_order_code(value):
+        return value
+    for prefix in ORDER_CODE_PREFIXES:
+        if not value.startswith(prefix):
+            continue
+        rest = value[len(prefix):].strip()
+        if rest.startswith(":") or rest.startswith("："):
+            rest = rest[1:].strip()
+        # 兑换前缀后必须存在订单码，且只能有一个 token
+        if not rest or len(rest.split()) != 1:
+            return None
+        code = rest
+        # 带前缀也必须符合爱发电长订单号形态；统一保存为原始数字串
+        return code if _looks_like_afdian_order_code(code) else None
+    return None
+
+
+def safe_amount(value, default: Decimal = Decimal("0")):
     try:
         result = Decimal(str(value))
         if not result.is_finite() or result < 0:
@@ -182,7 +225,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.5.0",
+    "0.5.1",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -457,6 +500,22 @@ class SponsorPassPlugin(Star):
 
     async def _on_blocked_message(self, event: AstrMessageEvent, umo: str, sender: str):
         text = str(event.message_str or "")
+        order_code = parse_order_code(text)
+        if not order_code and text.strip().isdigit() and _looks_like_afdian_order_code(text.strip()):
+            order_code = text.strip()
+        has_order_prefix = any(text.strip().startswith(prefix) for prefix in ORDER_CODE_PREFIXES)
+        if order_code or has_order_prefix:
+            if not bool(self._cfg("enable_order_code", True)):
+                if has_order_prefix:
+                    event.set_result(MessageEventResult().message("订单码兑换功能目前未开启，请联系管理员～").stop_event())
+                    return
+            elif not self._sponsor_enabled():
+                event.set_result(MessageEventResult().message("订单兑换通道还没配置好，请联系管理员～").stop_event())
+            elif not order_code:
+                event.set_result(MessageEventResult().message(self._cfg("order_code_invalid_text", DEFAULT_ORDER_CODE_INVALID_TEXT)).stop_event())
+            else:
+                await self._redeem_order_code(event, umo, sender, order_code)
+            return
         lowered = text.lower()
         if self._sponsor_enabled() and (
             any(k in text for k in SPONSOR_KEYWORDS) or any(k in lowered for k in SPONSOR_KEYWORDS)
@@ -489,6 +548,47 @@ class SponsorPassPlugin(Star):
         return bool(has_url and user_id and token)
 
     # ---------------- 爱发电赞助校验 ----------------
+
+    async def _redeem_order_code(self, event: AstrMessageEvent, umo: str, sender: str, order_code: str):
+        """用当前发送者QQ兑换爱发电订单号；订单核销一次后永久绑定。"""
+        event.set_result(
+            MessageEventResult()
+            .message(self._cfg("order_code_checking_text", DEFAULT_ORDER_CODE_CHECKING_TEXT))
+            .stop_event()
+        )
+        user_id = str(self._cfg("afdian_user_id", "") or "").strip()
+        token = str(self._cfg("afdian_token", "") or "").strip()
+        if not user_id or not token:
+            event.set_result(MessageEventResult().message("订单兑换通道还没配置好，请联系管理员～").stop_event())
+            return
+        order = await self._find_order_by_no(order_code, user_id, token)
+        if order is None:
+            event.set_result(MessageEventResult().message(self._cfg("order_code_not_found_text", DEFAULT_ORDER_CODE_NOT_FOUND_TEXT)).stop_event())
+            return
+        returned_no = str(order.get("out_trade_no", "")).strip()
+        if returned_no != order_code:
+            event.set_result(MessageEventResult().message(self._cfg("order_code_not_found_text", DEFAULT_ORDER_CODE_NOT_FOUND_TEXT)).stop_event())
+            return
+        try:
+            status = int(order["status"])
+        except (KeyError, TypeError, ValueError):
+            event.set_result(MessageEventResult().message("这个订单的支付状态异常，暂时不能兑换，请联系管理员～").stop_event())
+            return
+        if status != 2:
+            event.set_result(MessageEventResult().message("这个订单还没有支付完成，暂时不能兑换哦～").stop_event())
+            return
+        amount = safe_amount(order.get("total_amount"), Decimal("-1"))
+        minimum = safe_amount(self._cfg("min_amount", 5), Decimal("5"))
+        if amount < 0 or amount < minimum:
+            event.set_result(MessageEventResult().message(f"这个订单金额不足兑换门槛（当前 ¥{order.get('total_amount', '?')}，需要至少 ¥{minimum}）～").stop_event())
+            return
+        validity = await self._grant_pass_locked(sender, order, source="order_code")
+        if validity is None:
+            event.set_result(MessageEventResult().message(self._cfg("order_code_used_text", DEFAULT_ORDER_CODE_USED_TEXT)).stop_event())
+            return
+        self._clear_session_state(umo)
+        event.set_result(MessageEventResult().message(f"{self._cfg('order_code_success_text', DEFAULT_ORDER_CODE_SUCCESS_TEXT)}（{validity}）").stop_event())
+        await self._notify_owner(f"🔔 QQ {sender} 使用订单码兑换成功，订单号 {order_code}，金额 ¥{order.get('total_amount', '?')}（{validity}）", event=event)
 
     async def _handle_sponsor_claim(self, event: AstrMessageEvent, umo: str, sender: str):
         now = time.time()

@@ -26,7 +26,7 @@ desc: |
   拦截期每天仅提醒一次；赞助校验限频防刷；黑名单永久拦截；
   AstrBot 管理员自动豁免；好友申请/通知事件独立放行（与人际关系等插件兼容）；
   未配置爱发电时只提示等待同意，不会给出无效入口；仅处理私聊，不影响群聊。
-version: 0.5.0
+version: 0.5.1
 author: Nevino
 repo: https://github.com/Nevino2333/astrbot_plugin_sponsor_pass
 support_platforms:

@@ -586,5 +586,35 @@ pl._blocked.add("aiocqhttp:FriendMessage:123")
 pl._clear_session_state("aiocqhttp:FriendMessage:123")
 check("T49 清理会话同时清理pending", "aiocqhttp:FriendMessage:123" not in pl._pending)
 
+print("== 订单码兑换 ==")
+example_code = "202510121138244856494931049"
+check("T50 示例长订单号可识别", main.parse_order_code("订单号: " + example_code) == example_code)
+check("T51 兑换码前缀可识别", main.parse_order_code("兑换码：" + example_code) == example_code)
+check("T52 裸普通QQ号不识别", main.parse_order_code("123456789") is None)
+check("T53 裸金额不识别", main.parse_order_code("5") is None)
+check("T54 非法日期订单号不识别", main.parse_order_code("订单号: 202513011234567890123456") is None)
+check("T55 订单码含字母不识别", main.parse_order_code("订单号: 20251012ABC123456789") is None)
+check("T56 普通数字长串不识别", main.parse_order_code("123456789012345678901234567") is None)
+
+pl = make_plugin()
+_order_code = {"out_trade_no": example_code, "status": 2, "total_amount": "5.00", "remark": ""}
+async def _code_order(no, uid, token):
+    return _order_code if no == example_code else None
+pl._find_order_by_no = _code_order
+ev = FakeEvent(sender="313131", ts=T0, text="订单号: " + example_code)
+# 先建立拦截态
+for r in range(7):
+    ev = FakeEvent(sender="313131", ts=T0 + r * (W + 10), text="普通")
+    run(HANDLER(pl, ev))
+ev = FakeEvent(sender="313131", ts=T0 + 99999, text="订单号: " + example_code)
+run(HANDLER(pl, ev))
+check("T57 订单码兑换不依赖留言QQ", pl._claimed_orders.get(example_code) == "313131" and pl._passes.get("313131") == 0)
+check("T58 订单码兑换成功回复", "订单核验成功" in ev.reply_text())
+ev2 = FakeEvent(sender="414141", ts=T0 + 100000, text="订单号: " + example_code)
+# 同一插件实例的另一用户再次兑换同单
+pl._blocked.add(ev2.unified_msg_origin)
+run(HANDLER(pl, ev2))
+check("T59 已兑换订单不能换绑其他QQ", "不能重复使用" in ev2.reply_text() or "兑换过" in ev2.reply_text())
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
