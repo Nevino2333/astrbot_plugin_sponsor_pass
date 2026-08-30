@@ -618,9 +618,16 @@ check("T59 已兑换订单不能换绑其他QQ", "不能重复使用" in ev2.rep
 
 print("== 陌生人帮助 ==")
 pl = make_plugin()
-ev = FakeEvent(sender="717171", ts=T0, text="帮助")
+ev = FakeEvent(sender="717171", ts=int(time.time()), text="帮助")
 run(HANDLER(pl, ev))
-check("T60 未受阻陌生人帮助不计轮次", "订单号" in ev.reply_text() and not pl._rounds and ev.stopped)
+check("T60 未受阻陌生人帮助不被本插件拦截", not ev.stopped and not ev.results and pl._rounds.get("aiocqhttp:FriendMessage:717171") == 1, extra=repr({"stopped": ev.stopped, "results": ev.results, "rounds": pl._rounds}))
+async def run_public_help(pl, ev):
+    async for r in main.SponsorPassPlugin.public_admission_help(pl, ev):
+        ev.results.append(r)
+
+# 专用命令始终可查看本插件说明
+run(run_public_help(pl, ev))
+check("T60b 准入帮助专用命令可用", "订单号" in ev.reply_text())
 pl = make_plugin()
 for r in range(7):
     e = FakeEvent(sender="727272", ts=T0 + r * (W + 10), text="普通")

@@ -233,7 +233,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.5.2",
+    "0.5.3",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -435,13 +435,8 @@ class SponsorPassPlugin(Star):
         if sender in self._admins() or sender in self._whitelist():
             return  # 管理员与白名单：完全放行
 
-        if str(event.message_str or "").strip().lower() in {"帮助", "help", "/帮助", "?", "？"}:
-            event.set_result(
-                MessageEventResult()
-                .message(self._cfg("public_help_text", DEFAULT_PUBLIC_HELP_TEXT))
-                .stop_event()
-            )
-            return
+        # 普通“帮助”不在全局入口拦截，避免抢占其他插件的帮助命令。
+        # 已受阻会话仍由 _on_blocked_message 提供准入帮助。
 
         # 黑名单：无条件静默拦截
         if sender in self._blacklist():
@@ -1000,6 +995,11 @@ class SponsorPassPlugin(Star):
             return False
 
     # ---------------- 管理命令 ----------------
+
+    @filter.command("准入帮助")
+    async def public_admission_help(self, event: AstrMessageEvent):
+        """独立准入帮助命令，不占用通用“帮助”命令名。"""
+        yield event.plain_result(self._cfg("public_help_text", DEFAULT_PUBLIC_HELP_TEXT))
 
     @filter.command("准入")
     @filter.permission_type(filter.PermissionType.ADMIN)
