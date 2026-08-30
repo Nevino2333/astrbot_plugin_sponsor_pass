@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import time
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime
@@ -27,17 +28,35 @@ import aiohttp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
-from payments import (
-    AlipayProvider,
-    PaymentAlreadyClaimed,
-    PaymentError,
-    PaymentInvalid,
-    PaymentNotFound,
-    PaymentOrder,
-    PaymentServiceError,
-    PaymentUnpaid,
-    WechatPayProvider,
-)
+
+try:
+    from .payments import (
+        AlipayProvider,
+        PaymentError,
+        PaymentInvalid,
+        PaymentNotFound,
+        PaymentServiceError,
+        PaymentUnpaid,
+        WechatPayProvider,
+    )
+except ImportError:
+    # AstrBot 市场按单文件入口加载时没有包上下文，按同目录加载支付适配器。
+    import importlib.util
+
+    _payments_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "payments.py")
+    _payments_spec = importlib.util.spec_from_file_location("astrbot_sponsor_pass_payments", _payments_path)
+    if _payments_spec is None or _payments_spec.loader is None:
+        raise ImportError("无法加载支付适配器")
+    _payments_module = importlib.util.module_from_spec(_payments_spec)
+    sys.modules["astrbot_sponsor_pass_payments"] = _payments_module
+    _payments_spec.loader.exec_module(_payments_module)
+    AlipayProvider = _payments_module.AlipayProvider
+    PaymentError = _payments_module.PaymentError
+    PaymentInvalid = _payments_module.PaymentInvalid
+    PaymentNotFound = _payments_module.PaymentNotFound
+    PaymentServiceError = _payments_module.PaymentServiceError
+    PaymentUnpaid = _payments_module.PaymentUnpaid
+    WechatPayProvider = _payments_module.WechatPayProvider
 
 try:
     from astrbot.api.message_components import Plain  # noqa: F401  (预留)
