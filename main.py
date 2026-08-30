@@ -12,6 +12,7 @@ astrbot_plugin_sponsor_pass - 陌生人准入·赞助直通
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime
 from sys import maxsize
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -35,6 +37,22 @@ AFDIAN_API_HOSTS = (
     "https://afdian.com/api/open/query-order",
     "https://afdian.net/api/open/query-order",
 )
+AFDIAN_ALLOWED_HOSTS = {"afdian.com", "afdian.net"}
+
+
+def _safe_api_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in AFDIAN_ALLOWED_HOSTS:
+        raise ValueError("只允许访问爱发电官方 HTTPS API")
+    if parsed.port not in (None, 443):
+        raise ValueError("爱发电 API 不允许自定义端口")
+    try:
+        if parsed.hostname and ipaddress.ip_address(parsed.hostname).is_private:
+            raise ValueError("拒绝私有地址")
+    except ValueError as exc:
+        if "拒绝私有地址" in str(exc):
+            raise
+    return url
 
 DEFAULT_GATE_TEXT = (
     "先聊到这儿啦，我得去问问我哥同不同意～\n"
@@ -130,7 +148,8 @@ class PassStore:
             "passes": {},
             "claimed_orders": {},
             "pending": {},
-            "stats": {"gate_total": 0, "sponsor_pass_total": 0, "manual_pass_total": 0},
+            "audit": [],
+            "stats": {"gate_total": 0, "sponsor_pass_total": 0, "manual_pass_total": 0, "revenue_total": "0"},
         }
         os.makedirs(_STATE_DIR, exist_ok=True)
         self._load()
@@ -141,9 +160,12 @@ class PassStore:
                 loaded = json.load(f)
             if not isinstance(loaded, dict):
                 return
-            mapping_keys = {"rounds", "round_ts", "remind_day", "passes", "claimed_orders", "pending", "stats"}
+            mapping_keys = {"rounds", "round_ts", "remind_day", "passes", "claimed_orders", "pending", "audit", "stats"}
             for key in mapping_keys:
                 value = loaded.get(key)
+                if key == "audit":
+                    self.data[key] = value if isinstance(value, list) else []
+                    continue
                 if not isinstance(value, dict):
                     continue
                 if key == "pending":
@@ -233,7 +255,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.5.3",
+    "1.0.0",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -255,6 +277,7 @@ class SponsorPassPlugin(Star):
         self._passes: dict = {str(k): float(v) for k, v in (d.get("passes") or {}).items()}
         self._claimed_orders: dict = {str(k): str(v) for k, v in (d.get("claimed_orders") or {}).items()}
         self._pending: dict = {str(k): dict(v) for k, v in (d.get("pending") or {}).items() if isinstance(v, dict)}
+        self._audit: list = [v for v in (d.get("audit") or []) if isinstance(v, dict)][-200:]
         self._stats: dict = dict(d.get("stats") or {})
         # 瞬时状态（不落盘）
         self._check_ts: dict = {}  # umo -> 上次赞助校验时间（限频）
@@ -270,6 +293,7 @@ class SponsorPassPlugin(Star):
         self._store.data["passes"] = self._passes
         self._store.data["claimed_orders"] = self._claimed_orders
         self._store.data["pending"] = self._pending
+        self._store.data["audit"] = self._audit
         self._store.data["stats"] = self._stats
         self._store.save()
 
@@ -282,10 +306,42 @@ class SponsorPassPlugin(Star):
             return set()
 
     def _blacklist(self) -> set:
-        bl = self._cfg("blacklist", [])
-        if isinstance(bl, (list, tuple, set)):
-            return {str(x) for x in bl}
+        values = self._cfg("blacklist", [])
+        if isinstance(values, (list, tuple, set)):
+            return {str(value).strip() for value in values if str(value).strip()}
         return set()
+
+    def _allowed_ids(self, key: str) -> set:
+        values = self._cfg(key, [])
+        if isinstance(values, (list, tuple, set)):
+            return {str(value).strip() for value in values if str(value).strip()}
+        return set()
+
+    def _order_allowed(self, order: dict) -> bool:
+        """可选方案/商品白名单；列表为空表示不限制。"""
+        plans = self._allowed_ids("allowed_plan_ids")
+        products = self._allowed_ids("allowed_product_ids")
+        if not plans and not products:
+            return True
+        plan_id = str(order.get("plan_id", "")).strip()
+        product_id = str(order.get("product_id", order.get("sku_id", ""))).strip()
+        return (bool(plans) and plan_id in plans) or (bool(products) and product_id in products)
+
+    def _membership_days(self, amount: Decimal) -> int:
+        """按金额阶梯选择最高匹配有效期；未配置时使用默认值。"""
+        tiers = self._cfg("amount_tiers", [])
+        matches = []
+        if isinstance(tiers, list):
+            for tier in tiers:
+                if not isinstance(tier, dict):
+                    continue
+                minimum = safe_amount(tier.get("min_amount"), Decimal("-1"))
+                days = safe_int(tier.get("expire_days"), -1, minimum=0, maximum=3650)
+                if minimum >= 0 and days >= 0 and amount >= minimum:
+                    matches.append((minimum, days))
+        if matches:
+            return max(matches, key=lambda item: item[0])[1]
+        return safe_int(self._cfg("sponsor_expire_days", 0), 0, minimum=0, maximum=3650)
 
     def _save_config_list(self, key: str, values: set) -> bool:
         try:
@@ -737,10 +793,14 @@ class SponsorPassPlugin(Star):
             return None
         if trade_no in self._claimed_orders:
             return None
-        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0, minimum=0, maximum=3650)
+        if not self._order_allowed(order):
+            return None
+        expire_days = self._membership_days(safe_amount(order.get("total_amount"), Decimal("0")))
         units = self._order_units(order)
         if units < 1:
             return None
+        if not bool(self._cfg("stack_product_units", True)):
+            units = 1
         if expire_days > 0:
             total_days = expire_days * units
             self._passes[qq] = time.time() + total_days * 86400
@@ -752,6 +812,21 @@ class SponsorPassPlugin(Star):
             validity = "永久有效"
         if trade_no:
             self._claimed_orders[trade_no] = qq
+        self._audit.append({
+            "order_no": trade_no,
+            "qq": qq,
+            "amount": str(order.get("total_amount", "")),
+            "plan_id": str(order.get("plan_id", "")),
+            "product_id": str(order.get("product_id", order.get("sku_id", ""))),
+            "units": units,
+            "source": source,
+            "granted_days": expire_days * units if expire_days > 0 else 0,
+            "created_at": int(time.time()),
+        })
+        self._stats["revenue_total"] = str(
+            safe_amount(self._stats.get("revenue_total", "0"), Decimal("0"))
+            + safe_amount(order.get("total_amount"), Decimal("0"))
+        )
         if source == "sponsor":
             self._bump_stat("sponsor_pass_total")
         else:
@@ -761,6 +836,7 @@ class SponsorPassPlugin(Star):
 
     async def _fetch_order_page(self, host: str, user_id: str, token: str,
                                 page: int, per_page: int) -> dict:
+        host = _safe_api_url(host)
         params = json.dumps({"page": page, "per_page": per_page}, separators=(",", ":"))
         ts = int(time.time())
         body = {
@@ -791,6 +867,7 @@ class SponsorPassPlugin(Star):
         last_error = None
         for host in AFDIAN_API_HOSTS:
             try:
+                _safe_api_url(host)
                 for page in range(1, pages + 1):
                     data = await self._fetch_order_page(host, user_id, token, page, per_page)
                     if not isinstance(data, dict):
@@ -819,6 +896,8 @@ class SponsorPassPlugin(Star):
                             if order_amount == Decimal("-1"):
                                 continue  # 金额字段异常
                         except (TypeError, ValueError):
+                            continue
+                        if not self._order_allowed(order):
                             continue
                         trade_no = str(order.get("out_trade_no", ""))
                         if trade_no and trade_no in self._claimed_orders:
@@ -1080,10 +1159,15 @@ class SponsorPassPlugin(Star):
             return
 
         if action in ("统计", "stats"):
+            now = time.time()
+            active_passes = sum(1 for exp in self._passes.values() if exp == 0 or exp > now)
             yield event.plain_result(
                 f"累计触发准入 {self._stats.get('gate_total', 0)} 次；"
                 f"赞助直通 {self._stats.get('sponsor_pass_total', 0)} 人次；"
-                f"手动放行 {self._stats.get('manual_pass_total', 0)} 人次。"
+                f"手动放行 {self._stats.get('manual_pass_total', 0)} 人次；"
+                f"已核销订单 {len(self._claimed_orders)} 笔；"
+                f"累计实付 ¥{self._stats.get('revenue_total', '0')}；"
+                f"有效凭证 {active_passes} 人；待处理 {len(self._pending)} 人。"
             )
             return
 

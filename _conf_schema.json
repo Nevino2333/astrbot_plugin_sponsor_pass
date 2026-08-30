@@ -32,10 +32,28 @@
     "type": "int",
     "default": 30
   },
-  "max_product_units": {
-    "description": "单笔商品订单最多按多少份自动兑换，超过则转人工处理",
-    "type": "int",
-    "default": 10
+  "stack_product_units": {
+    "description": "商品多份购买是否按份数叠加有效期",
+    "type": "bool",
+    "default": true
+  },
+  "allowed_plan_ids": {
+    "description": "允许自动兑换的爱发电方案ID；留空表示不限制",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": []
+  },
+  "allowed_product_ids": {
+    "description": "允许自动兑换的爱发电商品ID；留空表示不限制",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": []
+  },
+  "amount_tiers": {
+    "description": "金额阶梯配置，每项为 {min_amount, expire_days}；留空使用默认有效期",
+    "type": "list",
+    "items": { "type": "object" },
+    "default": []
   },
   "blacklist": {
     "description": "黑名单QQ号（无条件静默拦截，/准入 拉黑 自动维护）",
