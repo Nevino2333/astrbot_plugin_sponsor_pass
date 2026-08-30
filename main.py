@@ -27,6 +27,17 @@ import aiohttp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
+from payments import (
+    AlipayProvider,
+    PaymentAlreadyClaimed,
+    PaymentError,
+    PaymentInvalid,
+    PaymentNotFound,
+    PaymentOrder,
+    PaymentServiceError,
+    PaymentUnpaid,
+    WechatPayProvider,
+)
 
 try:
     from astrbot.api.message_components import Plain  # noqa: F401  (预留)
@@ -99,9 +110,10 @@ DEFAULT_ORDER_CODE_USED_TEXT = "这个订单码已经兑换过了，不能重复
 DEFAULT_ORDER_CODE_SUCCESS_TEXT = "订单核验成功！你已经通过啦，之后可以继续和我聊天～"
 DEFAULT_PUBLIC_HELP_TEXT = (
     "这里是陌生人准入说明～\n"
-    "你可以先正常和我聊几轮；达到上限后有两种方式通过：\n"
+    "你可以先正常和我聊几轮；达到上限后有几种方式通过：\n"
     "① 等管理员同意；\n"
-    "② 在爱发电赞助/购买后，发送「我赞助了」，或直接发送爱发电订单号。\n"
+    "② 爱发电赞助/购买后发「我赞助了」，或直接发送爱发电订单号；\n"
+    "③ 已配置商户支付时，发送「微信订单号: 订单号」或「支付宝订单号: 订单号」。\n"
     "订单号示例：订单号: 202510121138244856494931049\n"
     "普通数字和QQ号不会触发订单兑换。"
 )
@@ -388,6 +400,36 @@ class SponsorPassPlugin(Star):
             value = default
         return default if value is None else value
 
+    def _payment_provider(self, name: str):
+        if name == "wechat" and bool(self._cfg("enable_wechat", False)):
+            return WechatPayProvider(
+                appid=str(self._cfg("wechat_appid", "") or "").strip(),
+                mchid=str(self._cfg("wechat_mchid", "") or "").strip(),
+                serial_no=str(self._cfg("wechat_serial_no", "") or "").strip(),
+                private_key=str(self._cfg("wechat_private_key", "") or ""),
+                api_v3_key=str(self._cfg("wechat_api_v3_key", "") or ""),
+                notify_url=str(self._cfg("wechat_notify_url", "") or "").strip(),
+            )
+        if name == "alipay" and bool(self._cfg("enable_alipay", False)):
+            return AlipayProvider(
+                app_id=str(self._cfg("alipay_app_id", "") or "").strip(),
+                private_key=str(self._cfg("alipay_private_key", "") or ""),
+                alipay_public_key=str(self._cfg("alipay_public_key", "") or ""),
+                notify_url=str(self._cfg("alipay_notify_url", "") or "").strip(),
+            )
+        return None
+
+    def _payment_key(self, provider: str, order_id: str) -> str:
+        return f"{provider}:{order_id}"
+
+    def _parse_payment_code(self, text: str):
+        value = str(text or "").strip()
+        for prefix, provider in (("微信订单号", "wechat"), ("微信订单", "wechat"), ("支付宝订单号", "alipay"), ("支付宝订单", "alipay")):
+            if value.startswith(prefix):
+                code = value[len(prefix):].lstrip(" :：")
+                return provider, code if re.fullmatch(r"[A-Za-z0-9_-]{6,64}", code) else ""
+        return None, ""
+
     @staticmethod
     def _private_kind(event: AstrMessageEvent) -> str:
         """返回会话类别：friend=好友私聊，temp=临时会话，""=不归本插件管（群聊等）。
@@ -574,6 +616,13 @@ class SponsorPassPlugin(Star):
                 .stop_event()
             )
             return
+        external_provider, external_code = self._parse_payment_code(text)
+        if external_provider or text.strip().startswith(("微信订单", "支付宝订单")):
+            if not external_code:
+                event.set_result(MessageEventResult().message("支付订单号格式不对，请使用“微信订单号: 订单号”或“支付宝订单号: 订单号”～").stop_event())
+            else:
+                await self._redeem_external_order(event, umo, sender, external_provider, external_code)
+            return
         order_code = parse_order_code(text)
         if not order_code and text.strip().isdigit() and _looks_like_afdian_order_code(text.strip()):
             order_code = text.strip()
@@ -623,6 +672,61 @@ class SponsorPassPlugin(Star):
 
     # ---------------- 爱发电赞助校验 ----------------
 
+    async def _handle_sponsor_claim(self, event: AstrMessageEvent, umo: str, sender: str):
+        cooldown = safe_int(self._cfg("check_cooldown", 300), 300, minimum=0, maximum=86400)
+        now = time.time()
+        if now - self._check_ts.get(umo, 0) < cooldown:
+            event.set_result(MessageEventResult().message("刚帮你查过啦，稍等几分钟再试试～").stop_event())
+            return
+        self._check_ts[umo] = now
+        user_id = str(self._cfg("afdian_user_id", "") or "").strip()
+        token = str(self._cfg("afdian_token", "") or "").strip()
+        if not user_id or not token:
+            event.set_result(MessageEventResult().message("赞助通道还没配置好，请联系管理员～").stop_event())
+            return
+        result = await self._search_orders(sender, user_id, token)
+        if result.get("service_error"):
+            event.set_result(MessageEventResult().message(DEFAULT_ORDER_CODE_ERROR_TEXT).stop_event())
+            return
+        order = result.get("match")
+        if order is None:
+            unclaimed = result.get("unclaimed")
+            if unclaimed is not None:
+                amount = unclaimed.get("total_amount", "?")
+                trade_no = str(unclaimed.get("out_trade_no", "?"))
+                event.set_result(MessageEventResult().message(
+                    self._format(self._cfg("unclaimed_text", DEFAULT_UNCLAIMED_TEXT), sender, amount).replace("{trade_no}", trade_no)
+                ).stop_event())
+                await self._notify_owner(
+                    f"检测到未备注QQ的爱发电订单：¥{amount}，订单号 {trade_no}。\n"
+                    f"申请人QQ：{sender}\n确认后执行：/准入 订单 {trade_no} {sender}", event=event
+                )
+                return
+            if result.get("other"):
+                event.set_result(MessageEventResult().message(
+                    self._cfg("claimed_other_text", DEFAULT_CLAIMED_OTHER_TEXT)
+                ).stop_event())
+                return
+            event.set_result(MessageEventResult().message(
+                self._format(self._cfg("not_found_text", DEFAULT_NOT_FOUND_TEXT), sender, self._cfg("min_amount", 5))
+            ).stop_event())
+            return
+        validity = await self._grant_pass_locked(sender, order, source="sponsor")
+        if validity is None:
+            event.set_result(MessageEventResult().message(
+                self._cfg("order_code_used_text", DEFAULT_ORDER_CODE_USED_TEXT)
+            ).stop_event())
+            return
+        self._clear_session_state(umo)
+        trade_no = str(order.get("out_trade_no", "?"))
+        amount = order.get("total_amount", "?")
+        event.set_result(MessageEventResult().message(
+            f"查到啦！感谢老板大气～你已经通过考验，以后随便找我玩！(๑•̀ㅂ•́)و✧（{validity}）"
+        ).stop_event())
+        await self._notify_owner(
+            f"QQ {sender} 通过爱发电赞助自动通过准入，金额 ¥{amount}，订单号 {trade_no}（{validity}）", event=event
+        )
+
     async def _redeem_order_code(self, event: AstrMessageEvent, umo: str, sender: str, order_code: str):
         """用当前发送者QQ兑换爱发电订单号；订单核销一次后永久绑定。"""
         event.set_result(
@@ -664,7 +768,61 @@ class SponsorPassPlugin(Star):
         event.set_result(MessageEventResult().message(f"{self._cfg('order_code_success_text', DEFAULT_ORDER_CODE_SUCCESS_TEXT)}（{validity}）").stop_event())
         await self._notify_owner(f"🔔 QQ {sender} 使用订单码兑换成功，订单号 {order_code}，金额 ¥{order.get('total_amount', '?')}（{validity}）", event=event)
 
-    async def _handle_sponsor_claim(self, event: AstrMessageEvent, umo: str, sender: str):
+    async def _redeem_external_order(self, event: AstrMessageEvent, umo: str, sender: str, provider_name: str, order_code: str):
+        provider = self._payment_provider(provider_name)
+        if provider is None or not provider.configured:
+            event.set_result(MessageEventResult().message("这个支付渠道还没有配置完成，请联系管理员～").stop_event())
+            return
+        try:
+            order = await provider.find_order_by_code(order_code)
+            if not order.paid:
+                event.set_result(MessageEventResult().message("订单还没有支付成功，支付完成后再发送订单号即可～").stop_event())
+                return
+            if order.amount < safe_amount(self._cfg("min_amount", 5), Decimal("5")):
+                event.set_result(MessageEventResult().message("订单金额还没有达到准入门槛～").stop_event())
+                return
+            normalized = {
+                "out_trade_no": order.order_id,
+                "total_amount": str(order.amount),
+                "remark": order.remark,
+                "plan_id": order.plan_id,
+                "product_id": order.product_id,
+                "sku_detail": [],
+            }
+            key = self._payment_key(provider_name, order.order_id)
+            if key in self._claimed_orders or order.order_id in self._claimed_orders:
+                event.set_result(MessageEventResult().message("这个订单已经兑换过了，不能重复使用哦～").stop_event())
+                return
+            # 统一把外部渠道订单放入带渠道命名空间的核销台账。
+            validity = await self._grant_external_pass(sender, normalized, key, provider_name)
+            if validity is None:
+                event.set_result(MessageEventResult().message("这个订单已经兑换过了，不能重复使用哦～").stop_event())
+                return
+            self._clear_session_state(umo)
+            event.set_result(MessageEventResult().message(f"订单核验成功！你已经通过啦～（{validity}）").stop_event())
+            await self._notify_owner(f"🔔 QQ {sender} 使用{provider_name}订单兑换成功：{order.order_id}，金额 ¥{order.amount}", event=event)
+        except PaymentUnpaid:
+            event.set_result(MessageEventResult().message("订单还没有支付成功，支付完成后再试～").stop_event())
+        except PaymentNotFound:
+            event.set_result(MessageEventResult().message("没有查到这个支付渠道的订单，请确认订单号完整无误～").stop_event())
+        except PaymentServiceError:
+            event.set_result(MessageEventResult().message("支付平台查询暂时不可用，请稍后再试，不要重复付款～").stop_event())
+        except PaymentError as exc:
+            logger.warning(f"[sponsor_pass] {provider_name} 订单核验失败: {exc}")
+            event.set_result(MessageEventResult().message("这个订单暂时无法核验，请联系管理员处理～").stop_event())
+
+    async def _grant_external_pass(self, qq: str, order: dict, key: str, provider_name: str):
+        async with self._claim_lock:
+            if key in self._claimed_orders:
+                return None
+            # 复用现有权益计算，但临时使用渠道命名空间核销。
+            original = order["out_trade_no"]
+            order["out_trade_no"] = key
+            try:
+                validity = self._grant_pass(qq, order, source=provider_name)
+            finally:
+                order["out_trade_no"] = original
+            return validity
         now = time.time()
         cooldown = safe_int(self._cfg("check_cooldown", 300), 300, minimum=0, maximum=86400)
         if now - self._check_ts.get(umo, 0) < cooldown:

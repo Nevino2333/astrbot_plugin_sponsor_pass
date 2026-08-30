@@ -15,6 +15,7 @@ import types
 logging.basicConfig(level=logging.CRITICAL)
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PLUGIN_DIR)
 
 # ---------------- astrbot 模块桩 ----------------
 

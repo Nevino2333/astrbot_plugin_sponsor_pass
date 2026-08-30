@@ -118,6 +118,126 @@
     "type": "bool",
     "default": true
   },
+  "enable_wechat": {
+    "description": "启用微信支付商户 API v3 订单查询；不支持个人收款码自动验单",
+    "type": "bool",
+    "default": false
+  },
+  "wechat_appid": {
+    "description": "微信支付绑定的 AppID",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_mchid": {
+    "description": "微信支付商户号",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_serial_no": {
+    "description": "微信支付商户 API 证书序列号",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_private_key": {
+    "description": "微信支付商户 API 私钥 PEM；严禁写入日志和仓库",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_api_v3_key": {
+    "description": "微信支付 API v3 Key；用于回调资源解密",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_notify_url": {
+    "description": "微信支付通知地址；生产环境建议使用公网 HTTPS",
+    "type": "string",
+    "default": ""
+  },
+  "enable_alipay": {
+    "description": "启用支付宝开放平台当面付订单查询；不支持个人收款码自动验单",
+    "type": "bool",
+    "default": false
+  },
+  "alipay_app_id": {
+    "description": "支付宝开放平台应用 AppID",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_private_key": {
+    "description": "支付宝应用 RSA2 私钥；严禁写入日志和仓库",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_public_key": {
+    "description": "支付宝公钥，用于响应和通知验签",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_notify_url": {
+    "description": "支付宝异步通知地址；生产环境建议使用公网 HTTPS",
+    "type": "string",
+    "default": ""
+  },
+  "enable_wechat": {
+    "description": "启用微信支付商户 API v3 订单核验；不支持个人收款码",
+    "type": "bool",
+    "default": false
+  },
+  "wechat_appid": {
+    "description": "微信支付商户绑定的 AppID",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_mchid": {
+    "description": "微信支付商户号",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_serial_no": {
+    "description": "微信支付商户 API 证书序列号",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_private_key": {
+    "description": "微信支付商户 API 私钥 PEM；不要写入日志或提交到仓库",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_api_v3_key": {
+    "description": "微信支付 API v3 Key；用于回调资源解密，不是请求签名私钥",
+    "type": "string",
+    "default": ""
+  },
+  "wechat_notify_url": {
+    "description": "微信支付通知地址；生产环境建议公网 HTTPS，当前插件不托管回调服务",
+    "type": "string",
+    "default": ""
+  },
+  "enable_alipay": {
+    "description": "启用支付宝开放平台当面付订单核验；不支持个人收款码",
+    "type": "bool",
+    "default": false
+  },
+  "alipay_app_id": {
+    "description": "支付宝开放平台应用 AppID",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_private_key": {
+    "description": "支付宝应用 RSA2 私钥；不要写入日志或提交到仓库",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_public_key": {
+    "description": "支付宝公钥，用于响应/通知验签",
+    "type": "string",
+    "default": ""
+  },
+  "alipay_notify_url": {
+    "description": "支付宝异步通知地址；生产环境建议公网 HTTPS，当前插件不托管回调服务",
+    "type": "string",
+    "default": ""
+  },
   "enable_order_code": {
     "description": "允许陌生人发送爱发电长订单号兑换；普通数字不会触发",
     "type": "bool",
