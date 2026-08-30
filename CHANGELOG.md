@@ -1,33 +1,42 @@
-# Changelog
+# 更新日志
 
-All notable changes to this plugin are documented here.
+本文件记录本插件的版本变更。
 
 ## 1.0.0 - 2026-08-30
 
-### Added
+### 新增
 
-- Public `准入帮助` command that does not claim the generic `帮助` command.
-- Fixed-window conversation quota for friend and optional temporary sessions.
-- Administrator approval and optional time-limited access grants.
-- Afdian `query-order` verification for sponsorship and product orders.
-- Verified Afdian order-number redemption for users who forgot to write their QQ in the order remark.
-- One-time order redemption ledger with concurrent redemption protection.
-- Product quantity handling through `sku_detail`, with a configurable maximum.
-- Optional plan/product allowlists for controlled automatic access.
-- Configurable amount tiers for different membership durations.
-- Pending approval queue, notification retry, status, statistics, and self-check commands.
-- Persistent state under AstrBot's `data/plugin_data` directory.
-- Strict order validation, Decimal money comparisons, malformed-state recovery, and service-error messaging.
+- 新增公开的 `准入帮助` 命令，不占用通用的 `帮助` 命令名。
+- 新增好友私聊和可选临时会话的固定窗口轮次限制。
+- 新增管理员同意和限时放行能力。
+- 新增爱发电 `query-order` 赞助订单和商品订单核验。
+- 新增爱发电订单号自助兑换，解决用户忘记填写 QQ 留言的问题。
+- 新增一次性订单核销台账和并发兑换保护。
+- 新增通过 `sku_detail` 处理商品购买份数，并支持配置单笔最大份数。
+- 新增可选的爱发电方案 ID 和商品 ID 白名单。
+- 新增可配置的金额阶梯和会员有效期。
+- 新增待审批队列、通知重试、状态查询、统计和自检命令。
+- 新增保存在 AstrBot `data/plugin_data` 目录中的持久化状态。
+- 新增严格订单校验、`Decimal` 金额比较、损坏状态恢复和接口故障提示。
 
-### Security
+### 安全
 
-- A user cannot gain access from an order number that is only syntactically valid; the order must be returned by the configured Afdian API with the exact same `out_trade_no`.
-- Unpaid, underpaid, malformed, already redeemed, or disallowed orders are rejected.
-- No automatic friend requests, friend acceptance, nickname-based payment matching, or high-frequency polling.
-- Afdian credentials are never written to plugin state or logs.
+- 仅凭格式正确的订单号不能获得权限；订单必须由配置的爱发电 API 返回，且 `out_trade_no` 完全一致。
+- 未支付、金额不足、字段异常、已核销或不符合商品规则的订单都会被拒绝。
+- 不自动发送好友申请，不自动接受好友申请，不通过昵称匹配付款，也不进行高频轮询。
+- 爱发电凭据不会写入插件状态或日志。
+- 爱发电请求只允许官方 HTTPS 地址，并拒绝本机、环回、私有和保留地址。
 
-### Compatibility
+### 兼容性
 
-- Generic `帮助` is not intercepted before a user reaches the access gate, so other plugins can handle their own help commands.
-- Friend request and notice events are passed through for relationship-management plugins.
-- Existing `claimed_orders`, `passes`, `pending`, and whitelist configuration data remain compatible.
+- 用户达到准入门槛前，通用 `帮助` 不会被本插件拦截，其他插件可以继续处理自己的帮助命令。
+- 已进入拦截状态的陌生人可以发送 `帮助` 查看准入说明。
+- 好友申请和通知事件会继续传递给人际关系管理插件。
+- 已有的 `claimed_orders`、`passes`、`pending` 和白名单配置保持兼容。
+- 与 whitelistpro 同时使用时，应关闭 whitelistpro 的好友私聊白名单子开关，避免重复拦截；群聊等其它控制功能不受影响。
+
+### 升级说明
+
+- 从 0.x 版本升级时不会清空已有订单核销记录和放行状态。
+- 新增配置项使用安全默认值，不会覆盖已有配置。
+- 建议升级后执行 `/准入 自检`，确认管理员、爱发电凭据、订单号兑换和状态文件均正常。

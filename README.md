@@ -1,4 +1,4 @@
-# astrbot_plugin_sponsor_pass
+# 陌生人准入·赞助直通（astrbot_plugin_sponsor_pass）
 
 陌生人准入、爱发电订单核验和会员权益发放插件，适用于 AstrBot + OneBot v11（`aiocqhttp`）。
 
