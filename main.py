@@ -16,6 +16,7 @@ import json
 import os
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from datetime import date
 from sys import maxsize
 
@@ -110,12 +111,25 @@ class PassStore:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                for key in self.data:
-                    if key in loaded and loaded[key] is not None:
-                        self.data[key] = loaded[key]
-        except Exception:
-            pass  # 首次运行或文件损坏：从零开始
+            if not isinstance(loaded, dict):
+                return
+            mapping_keys = {"rounds", "round_ts", "remind_day", "passes", "claimed_orders", "pending", "stats"}
+            for key in mapping_keys:
+                value = loaded.get(key)
+                if not isinstance(value, dict):
+                    continue
+                if key == "pending":
+                    value = {str(k): v for k, v in value.items() if isinstance(v, dict)}
+                elif key == "stats":
+                    value = {str(k): v for k, v in value.items() if isinstance(v, (int, float))}
+                else:
+                    value = {str(k): v for k, v in value.items()}
+                self.data[key] = value
+            blocked = loaded.get("blocked")
+            if isinstance(blocked, list):
+                self.data["blocked"] = [str(x) for x in blocked if isinstance(x, (str, int))]
+        except Exception as e:
+            logger.warning(f"[sponsor_pass] 状态文件读取失败，将使用空状态: {e}")
 
     def save(self):
         try:
@@ -126,25 +140,34 @@ class PassStore:
             logger.warning(f"[sponsor_pass] 状态保存失败: {e}")
 
 
-def afdian_sign(token: str, user_id: str, params_json: str, ts: int, algo: str = "md5") -> str:
-    """按接口代次生成爱发电开放接口签名。
+def afdian_sign(token: str, user_id: str, params_json: str, ts: int) -> str:
+    """爱发电 query-order 协议签名。
 
-    新版 query-orders（优先）：sign = HMAC-SHA256(key=token, msg=params).hexdigest()
-    旧版 query-order （兜底）：sign = md5(token + 'params' + params + 'ts' + ts + 'user_id' + user_id)
-    旧版算法由爱发电协议强制规定（不可更换为更强算法），官方文档示例向量：
-      token=123, params={"a":333}, ts=1624339905, user_id=abc -> a4acc28b81598b7e5d84ebdc3e91710c
+    爱发电旧版开放接口规定使用 MD5；该哈希仅用于接口协议兼容，不用于密码或安全存储。
     """
-    if algo == "hmac-sha256":
-        return hmac.new(token.encode("utf-8"), params_json.encode("utf-8"), hashlib.sha256).hexdigest()
-    digestmod = getattr(hashlib, "md5")  # 协议强制要求，见 docstring
     raw = f"{token}params{params_json}ts{ts}user_id{user_id}"
-    return digestmod(raw.encode("utf-8")).hexdigest()
+    return getattr(hashlib, "md5")(raw.encode("utf-8")).hexdigest()
 
 
-def safe_int(value, default: int) -> int:
+def safe_int(value, default: int, minimum=None, maximum=None) -> int:
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def safe_amount(value, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        result = Decimal(str(value))
+        if not result.is_finite() or result < 0:
+            return default
+        return result
+    except (InvalidOperation, TypeError, ValueError):
         return default
 
 
@@ -159,7 +182,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.4.2",
+    "0.5.0",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -184,6 +207,7 @@ class SponsorPassPlugin(Star):
         self._stats: dict = dict(d.get("stats") or {})
         # 瞬时状态（不落盘）
         self._check_ts: dict = {}  # umo -> 上次赞助校验时间（限频）
+        self._claim_lock = asyncio.Lock()
 
     # ---------------- 基础工具 ----------------
 
@@ -226,11 +250,21 @@ class SponsorPassPlugin(Star):
         self._rounds.pop(umo, None)
         self._round_ts.pop(umo, None)
         self._remind_day.pop(umo, None)
+        self._pending.pop(umo, None)
         self._persist()
 
     def _clear_state_by_qq(self, qq: str):
-        for umo in [u for u in list(self._blocked) + list(self._rounds) if u.endswith(qq)]:
-            self._clear_session_state(umo)
+        def matches(umo: str) -> bool:
+            return str(umo).rsplit(":", 1)[-1] == qq
+
+        for umo in set(self._blocked) | set(self._rounds):
+            if matches(umo):
+                self._clear_session_state(umo)
+        self._pending = {
+            key: value for key, value in self._pending.items()
+            if str(value.get("qq", "")) != qq
+        }
+        self._persist()
 
     def _bump_stat(self, key: str):
         try:
@@ -381,9 +415,8 @@ class SponsorPassPlugin(Star):
 
         # 轮次计数：使用固定窗口起点，窗口内的消息不会刷新起点。
         # 这样即使对方每隔 round_window-1 秒发一条，也会在窗口结束后进入下一轮，不能无限续杯。
-        window = safe_int(self._cfg("round_window", 180), 180)
-        window = max(1, window)
-        max_rounds = safe_int(self._cfg("max_rounds", 6), 6)
+        window = safe_int(self._cfg("round_window", 180), 180, minimum=1, maximum=86400)
+        max_rounds = safe_int(self._cfg("max_rounds", 6), 6, minimum=0, maximum=1000)
         msg_ts = self._get_timestamp(event)
         window_start = self._round_ts.get(umo)
         if window_start is None or (msg_ts - window_start) > window:
@@ -459,7 +492,7 @@ class SponsorPassPlugin(Star):
 
     async def _handle_sponsor_claim(self, event: AstrMessageEvent, umo: str, sender: str):
         now = time.time()
-        cooldown = safe_int(self._cfg("check_cooldown", 300), 300)
+        cooldown = safe_int(self._cfg("check_cooldown", 300), 300, minimum=0, maximum=86400)
         if now - self._check_ts.get(umo, 0) < cooldown:
             event.set_result(
                 MessageEventResult()
@@ -480,7 +513,14 @@ class SponsorPassPlugin(Star):
             return
 
         result = await self._search_orders(sender, user_id, token)
-        matched = result["match"]
+        if result.get("service_error"):
+            event.set_result(
+                MessageEventResult()
+                .message("爱发电查询暂时失败，请稍后再试，不要重复付款～")
+                .stop_event()
+            )
+            return
+        matched = result.get("match")
         if matched is None:
             unclaimed = result["unclaimed"]
             if unclaimed is not None:
@@ -518,7 +558,7 @@ class SponsorPassPlugin(Star):
 
         order = matched
         trade_no = str(order.get("out_trade_no", "?"))
-        validity = self._grant_pass(sender, order, source="sponsor")
+        validity = await self._grant_pass_locked(sender, order, source="sponsor")
         if validity is None:
             event.set_result(
                 MessageEventResult()
@@ -540,36 +580,49 @@ class SponsorPassPlugin(Star):
             f"订单号 {trade_no}（{validity}）", event=event
         )
 
-    @staticmethod
-    def _order_units(order: dict) -> int:
-        """售卖方案按份购买的数量（sku_detail 求和，兼容 dict/字符串/数字），常规赞助记 1 份。"""
+    def _order_units(self, order: dict) -> int:
+        """解析商品份数；异常或过大数量返回 0，交由人工处理。"""
+        maximum = safe_int(self._cfg("max_product_units", 10), 10, minimum=1, maximum=100)
         total = 1
         try:
             sku = order.get("sku_detail")
             if isinstance(sku, str):
                 sku = json.loads(sku)
-            if isinstance(sku, list) and sku:
-                counts = []
-                for item in sku:
-                    if isinstance(item, dict):
-                        c = safe_int(item.get("count", item.get("num", 1)), 1)
-                    elif isinstance(item, (int, float)):
-                        c = safe_int(item, 1)
-                    else:
-                        c = 1
-                    counts.append(max(1, c))
-                total = max(1, sum(counts))
-        except Exception:
-            total = 1
+            if sku is None:
+                return 1
+            if not isinstance(sku, list):
+                return 0
+            counts = []
+            for item in sku:
+                if not isinstance(item, dict):
+                    return 0
+                raw_count = item.get("count", item.get("num", 1))
+                count = int(raw_count)
+                if count < 1:
+                    return 0
+                counts.append(count)
+            total = sum(counts) if counts else 1
+            if total > maximum:
+                return 0
+        except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
+            return 0
         return total
 
+    async def _grant_pass_locked(self, qq: str, order: dict, source: str = "sponsor"):
+        async with self._claim_lock:
+            return self._grant_pass(qq, order, source)
+
     def _grant_pass(self, qq: str, order: dict, source: str = "sponsor"):
-        """发放放行凭证（含核销台账防重复使用）。返回有效期描述；订单已被核销时返回 None。"""
-        trade_no = str(order.get("out_trade_no", ""))
-        if trade_no and trade_no in self._claimed_orders:
+        """发放放行凭证；订单必须已在调用方完成严格核验。"""
+        trade_no = str(order.get("out_trade_no", "")).strip()
+        if not trade_no:
             return None
-        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0)
+        if trade_no in self._claimed_orders:
+            return None
+        expire_days = safe_int(self._cfg("sponsor_expire_days", 0), 0, minimum=0, maximum=3650)
         units = self._order_units(order)
+        if units < 1:
+            return None
         if expire_days > 0:
             total_days = expire_days * units
             self._passes[qq] = time.time() + total_days * 86400
@@ -613,25 +666,40 @@ class SponsorPassPlugin(Star):
         match=留言含该QQ的有效订单；unclaimed=有效但留言没写任何号码（防呆线索）；
         other=存在留言写了其他号码的订单。
         """
-        pages = max(1, min(safe_int(self._cfg("check_pages", 3), 3), 10))
+        pages = safe_int(self._cfg("check_pages", 3), 3, minimum=1, maximum=10)
         per_page = 50
-        min_amount = float(safe_int(self._cfg("min_amount", 5), 5))
-        found = {"match": None, "unclaimed": None, "other": False}
+        min_amount = safe_amount(self._cfg("min_amount", 5), Decimal("5"))
+        found = {"match": None, "unclaimed": None, "other": False, "service_error": False}
         last_error = None
         for host in AFDIAN_API_HOSTS:
             try:
                 for page in range(1, pages + 1):
                     data = await self._fetch_order_page(host, user_id, token, page, per_page)
-                    if not isinstance(data, dict) or int(data.get("ec", -1)) != 200:
-                        raise RuntimeError(f"接口返回异常 ec={data.get('ec') if isinstance(data, dict) else data}")
-                    payload = data.get("data") or {}
+                    if not isinstance(data, dict):
+                        raise RuntimeError("爱发电返回格式异常")
+                    try:
+                        ec = int(data.get("ec", -1))
+                    except (TypeError, ValueError):
+                        raise RuntimeError("爱发电返回 ec 异常")
+                    if ec != 200:
+                        raise RuntimeError(f"爱发电接口返回异常 ec={ec}")
+                    payload = data.get("data")
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("爱发电返回 data 异常")
                     orders = payload.get("list") or []
+                    if not isinstance(orders, list):
+                        raise RuntimeError("爱发电返回 list 异常")
                     for order in orders:
+                        if not isinstance(order, dict):
+                            continue
                         try:
-                            if int(order.get("status", 0)) != 2:
+                            if int(order.get("status", "-1")) != 2:
                                 continue  # 未支付/关闭的订单不参与
-                            if float(order.get("total_amount", 0) or 0) < min_amount:
+                            order_amount = safe_amount(order.get("total_amount"), Decimal("-1"))
+                            if order_amount < min_amount:
                                 continue  # 金额不足
+                            if order_amount == Decimal("-1"):
+                                continue  # 金额字段异常
                         except (TypeError, ValueError):
                             continue
                         trade_no = str(order.get("out_trade_no", ""))
@@ -645,7 +713,10 @@ class SponsorPassPlugin(Star):
                             found["other"] = True  # 留言写了号码但不是对方
                         elif found["unclaimed"] is None:
                             found["unclaimed"] = order
-                    total_count = int(payload.get("total_count", 0) or 0)
+                    try:
+                        total_count = int(payload.get("total_count", 0) or 0)
+                    except (TypeError, ValueError):
+                        raise RuntimeError("爱发电返回 total_count 异常")
                     if page * per_page >= total_count:
                         return found
                 return found
@@ -655,11 +726,15 @@ class SponsorPassPlugin(Star):
                 continue
         if last_error:
             logger.warning(f"[sponsor_pass] 爱发电查询最终失败: {last_error}")
+            found["service_error"] = True
         return found
 
     async def _find_order_by_no(self, trade_no: str, user_id: str, token: str):
-        """按订单号精确查询（out_trade_no）。"""
-        params = json.dumps({"out_trade_no": str(trade_no)}, separators=(",", ":"))
+        """按订单号精确查询；异常响应和服务不可用统一安全失败。"""
+        trade_no = str(trade_no or "").strip()
+        if not trade_no:
+            return None
+        params = json.dumps({"out_trade_no": trade_no}, separators=(",", ":"))
         ts = int(time.time())
         body = {
             "user_id": user_id,
@@ -674,10 +749,22 @@ class SponsorPassPlugin(Star):
                 async with aiohttp.ClientSession() as session:
                     async with session.post(host, json=body, timeout=timeout) as resp:
                         data = await resp.json(content_type=None)
-                if not isinstance(data, dict) or int(data.get("ec", -1)) != 200:
-                    raise RuntimeError(f"接口返回异常 ec={data.get('ec') if isinstance(data, dict) else data}")
-                for order in (data.get("data") or {}).get("list") or []:
-                    if str(order.get("out_trade_no", "")) == str(trade_no):
+                try:
+                    ec = int(data["ec"])
+                except (KeyError, TypeError, ValueError):
+                    raise RuntimeError("爱发电按订单查询返回 ec 异常")
+                if ec != 200:
+                    raise RuntimeError(f"爱发电接口返回异常 ec={ec}")
+                payload = data.get("data")
+                if not isinstance(payload, dict):
+                    raise RuntimeError("爱发电按订单查询返回 data 异常")
+                orders = payload.get("list")
+                if not isinstance(orders, list):
+                    raise RuntimeError("爱发电按订单查询返回 list 异常")
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    if str(order.get("out_trade_no", "")).strip() == trade_no:
                         return order
                 return None
             except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as e:
@@ -710,6 +797,25 @@ class SponsorPassPlugin(Star):
             self._remind_day.pop("gate_notice:" + umo, None)
             self._persist()
 
+    @staticmethod
+    def _send_result_ok(result) -> bool:
+        """仅把 OneBot 明确成功的返回值视为发送成功。"""
+        if result is None:
+            return True
+        if not isinstance(result, dict):
+            return True
+        status = result.get("status")
+        retcode = result.get("retcode")
+        if status is not None and str(status).lower() not in ("ok", "success"):
+            return False
+        if retcode is not None:
+            try:
+                if int(retcode) != 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
     async def _send_private_via_event(self, event: AstrMessageEvent, qq: str, text: str) -> bool:
         """优先复用当前 aiocqhttp bot 直发，避免统一会话路由不支持主动私聊。"""
         try:
@@ -718,15 +824,15 @@ class SponsorPassPlugin(Star):
             if sender is not None:
                 result = sender(user_id=int(qq), message=text)
                 if hasattr(result, "__await__"):
-                    await result
-                return True
+                    result = await result
+                return self._send_result_ok(result)
             api = getattr(bot, "api", None)
             call_action = getattr(api, "call_action", None)
             if call_action is not None:
                 result = call_action("send_private_msg", user_id=int(qq), message=text)
                 if hasattr(result, "__await__"):
-                    await result
-                return True
+                    result = await result
+                return self._send_result_ok(result)
         except Exception as e:
             logger.warning(f"[sponsor_pass] 当前 bot 私聊发送失败({qq}): {e}")
         return False
@@ -784,9 +890,53 @@ class SponsorPassPlugin(Star):
         if action in ("帮助", "help", ""):
             yield event.plain_result(
                 "用法：/准入 同意 <QQ号> [天数] | /准入 移除 <QQ号> | /准入 拉黑 <QQ号> | "
-                "/准入 解黑 <QQ号> | /准入 订单 <订单号> <QQ号> | /准入 状态 <QQ号> | "
-                "/准入 重置 <QQ号> | /准入 统计 | /准入 列表"
+                "/准入 解黑 <QQ号> | /准入 订单 <订单号> <QQ号> | /准入 待处理 | "
+                "/准入 通知重试 <QQ号> | /准入 自检 | /准入 状态 <QQ号> | /准入 重置 <QQ号> | /准入 统计 | /准入 列表"
             )
+            return
+
+        if action in ("待处理", "pending"):
+            now = time.time()
+            retention = safe_int(self._cfg("pending_retention_days", 30), 30, minimum=1, maximum=365) * 86400
+            stale = [key for key, value in self._pending.items()
+                     if not isinstance(value, dict) or now - float(value.get("last_seen_at", 0) or 0) > retention]
+            for key in stale:
+                self._pending.pop(key, None)
+            if stale:
+                self._persist()
+            lines = []
+            for key, value in self._pending.items():
+                if not isinstance(value, dict):
+                    continue
+                pqq = str(value.get("qq", "?"))
+                cnt = self._rounds.get(key, 0)
+                lines.append(f"QQ {pqq}：已聊 {cnt} 轮，申请时间 {value.get('created_at', '?')}")
+            yield event.plain_result("\n".join(lines) if lines else "当前没有待处理申请")
+            return
+
+        if action in ("自检", "check"):
+            state_ok = False
+            try:
+                self._persist()
+                state_ok = True
+            except Exception:
+                pass
+            yield event.plain_result(
+                f"插件 0.5.0\n准入：{'开启' if self._cfg('enable', True) else '关闭'}\n"
+                f"临时会话：{'开启' if self._cfg('enable_temp_session', True) else '关闭'}\n"
+                f"管理员：{'已配置' if self._admins() else '未读取到'}\n"
+                f"爱发电凭据：{'已配置' if self._sponsor_enabled() else '未完整配置'}\n"
+                f"状态文件：{'可读写' if state_ok else '写入失败'}\n"
+                f"待处理：{len(self._pending)} 人，已核销订单：{len(self._claimed_orders)} 笔"
+            )
+            return
+
+        if action in ("通知重试", "retry"):
+            if not qq.isdigit():
+                yield event.plain_result("用法：/准入 通知重试 <QQ号>")
+                return
+            sent = await self._send_to(qq, self._cfg("approved_text", DEFAULT_APPROVED_TEXT), event=event)
+            yield event.plain_result("已重试通知申请人" if sent else "通知仍然失败，请让对方主动发消息")
             return
 
         if action in ("列表", "list"):
@@ -893,23 +1043,31 @@ class SponsorPassPlugin(Star):
             if order is None:
                 yield event.plain_result(f"没有查到订单 {trade_no}，确认订单号是否正确")
                 return
+            returned_no = str(order.get("out_trade_no", "")).strip()
+            if not returned_no or returned_no != trade_no:
+                yield event.plain_result("订单号校验失败，接口返回的数据不一致，未执行核销")
+                return
             try:
-                if int(order.get("status", 0)) != 2:
-                    yield event.plain_result(f"订单 {trade_no} 还未支付完成（status={order.get('status')}），不能核销")
-                    return
-            except (TypeError, ValueError):
-                pass
-            amount = order.get("total_amount", "?")
-            try:
-                if float(amount or 0) < float(safe_int(self._cfg("min_amount", 5), 5)):
-                    yield event.plain_result(
-                        f"该订单金额 ¥{amount} 低于门槛 ¥{self._cfg('min_amount', 5)}；"
-                        f"如确实要放行请用 /准入 同意 {target_qq}"
-                    )
-                    return
-            except (TypeError, ValueError):
-                pass
-            validity = self._grant_pass(target_qq, order, source="manual")
+                status = int(order["status"])
+            except (KeyError, TypeError, ValueError):
+                yield event.plain_result(f"订单 {trade_no} 的支付状态异常，未执行核销")
+                return
+            if status != 2:
+                yield event.plain_result(f"订单 {trade_no} 还未支付完成（status={status}），不能核销")
+                return
+            amount = safe_amount(order.get("total_amount"), Decimal("-1"))
+            if amount < 0:
+                yield event.plain_result(f"订单 {trade_no} 的金额字段异常，未执行核销")
+                return
+            minimum = safe_amount(self._cfg("min_amount", 5), Decimal("5"))
+            if amount < minimum:
+                yield event.plain_result(
+                    f"该订单金额 ¥{amount} 低于门槛 ¥{minimum}；"
+                    f"如确实要放行请用 /准入 同意 {target_qq}"
+                )
+                return
+            amount_text = str(order.get("total_amount"))
+            validity = await self._grant_pass_locked(target_qq, order, source="manual")
             if validity is None:
                 yield event.plain_result(
                     f"订单 {trade_no} 已被核销过（绑定给 {self._claimed_orders.get(trade_no, '?')}），不能重复使用"

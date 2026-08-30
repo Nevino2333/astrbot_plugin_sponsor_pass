@@ -27,6 +27,16 @@
     "type": "bool",
     "default": true
   },
+  "pending_retention_days": {
+    "description": "待处理申请最多保留天数，过期记录会在查看待处理时清理",
+    "type": "int",
+    "default": 30
+  },
+  "max_product_units": {
+    "description": "单笔商品订单最多按多少份自动兑换，超过则转人工处理",
+    "type": "int",
+    "default": 10
+  },
   "blacklist": {
     "description": "黑名单QQ号（无条件静默拦截，/准入 拉黑 自动维护）",
     "type": "list",

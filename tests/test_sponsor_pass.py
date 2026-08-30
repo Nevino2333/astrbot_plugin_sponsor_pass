@@ -540,5 +540,51 @@ ev = FakeEvent(sender="8888")
 run(run_cmd(pl, ev, "订单", "U1", "616161"))
 check("T43 未支付订单不能核销", "不能核销" in ev.reply_text())
 
+print("== 最终版异常回归 ==")
+# 精确 QQ 清理：123 不得清理 9123
+pl = make_plugin()
+pl._blocked.update({"aiocqhttp:FriendMessage:123", "aiocqhttp:FriendMessage:9123"})
+pl._rounds.update({"aiocqhttp:FriendMessage:123": 7, "aiocqhttp:FriendMessage:9123": 7})
+pl._clear_state_by_qq("123")
+check("T45 短QQ精确清理不误伤后缀用户", "aiocqhttp:FriendMessage:123" not in pl._blocked and "aiocqhttp:FriendMessage:9123" in pl._blocked)
+
+# OneBot 返回 failed/retcode 时不报发送成功
+class FakeBot:
+    async def send_private_msg(self, **kwargs):
+        return {"status": "failed", "retcode": 100, "message": "not friend"}
+class BotEvent(FakeEvent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bot = FakeBot()
+pl = make_plugin()
+ev = BotEvent(sender="8888")
+check("T46 OneBot失败返回不判定为成功", not run(pl._send_private_via_event(ev, "123456", "x")))
+
+# status/amount 脏字段不得手动核销
+for bad in ({"out_trade_no": "S1", "total_amount": "9.9", "remark": "", "status": None},
+            {"out_trade_no": "S2", "total_amount": "abc", "remark": "", "status": 2}):
+    pl = make_plugin()
+    async def _bad_no(no, uid, token, order=bad):
+        return order
+    pl._find_order_by_no = _bad_no
+    ev = FakeEvent(sender="8888")
+    run(run_cmd(pl, ev, "订单", bad["out_trade_no"], "616161"))
+    check("T47 脏订单字段拒绝核销", "未执行核销" in ev.reply_text() and not pl._passes)
+
+# 双域名都失败要返回 service_error
+pl = make_plugin()
+async def _down(*args):
+    raise RuntimeError("down")
+pl._fetch_order_page = _down
+res = run(pl._search_orders("123456", "uid", "tok"))
+check("T48 双域名失败返回服务故障", res.get("service_error") is True)
+
+# 状态 pending 清理
+pl = make_plugin()
+pl._pending["aiocqhttp:FriendMessage:123"] = {"qq": "123", "last_seen_at": int(time.time())}
+pl._blocked.add("aiocqhttp:FriendMessage:123")
+pl._clear_session_state("aiocqhttp:FriendMessage:123")
+check("T49 清理会话同时清理pending", "aiocqhttp:FriendMessage:123" not in pl._pending)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
