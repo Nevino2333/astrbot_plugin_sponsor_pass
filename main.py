@@ -79,6 +79,14 @@ DEFAULT_ORDER_CODE_CHECKING_TEXT = "收到啦，正在核验订单，请不要�
 DEFAULT_ORDER_CODE_NOT_FOUND_TEXT = "没有查到这个订单码对应的已支付订单，请确认订单号是否完整～"
 DEFAULT_ORDER_CODE_USED_TEXT = "这个订单码已经兑换过了，不能重复使用哦～"
 DEFAULT_ORDER_CODE_SUCCESS_TEXT = "订单核验成功！你已经通过啦，之后可以继续和我聊天～"
+DEFAULT_PUBLIC_HELP_TEXT = (
+    "这里是陌生人准入说明～\n"
+    "你可以先正常和我聊几轮；达到上限后有两种方式通过：\n"
+    "① 等管理员同意；\n"
+    "② 在爱发电赞助/购买后，发送「我赞助了」，或直接发送爱发电订单号。\n"
+    "订单号示例：订单号: 202510121138244856494931049\n"
+    "普通数字和QQ号不会触发订单兑换。"
+)
 DEFAULT_ORDER_CODE_ERROR_TEXT = "订单查询服务暂时不可用，请稍后再试，不要重复付款～"
 
 DEFAULT_UNCLAIMED_TEXT = (
@@ -225,7 +233,7 @@ def remark_has_qq(remark: str, qq: str) -> bool:
     "astrbot_plugin_sponsor_pass",
     "Nevino",
     "陌生人准入：先自由聊N轮，之后可选择等待管理员同意或通过爱发电赞助自动通过",
-    "0.5.1",
+    "0.5.2",
     "https://github.com/Nevino2333/astrbot_plugin_sponsor_pass",
 )
 class SponsorPassPlugin(Star):
@@ -427,6 +435,14 @@ class SponsorPassPlugin(Star):
         if sender in self._admins() or sender in self._whitelist():
             return  # 管理员与白名单：完全放行
 
+        if str(event.message_str or "").strip().lower() in {"帮助", "help", "/帮助", "?", "？"}:
+            event.set_result(
+                MessageEventResult()
+                .message(self._cfg("public_help_text", DEFAULT_PUBLIC_HELP_TEXT))
+                .stop_event()
+            )
+            return
+
         # 黑名单：无条件静默拦截
         if sender in self._blacklist():
             event.stop_event()
@@ -500,6 +516,13 @@ class SponsorPassPlugin(Star):
 
     async def _on_blocked_message(self, event: AstrMessageEvent, umo: str, sender: str):
         text = str(event.message_str or "")
+        if text.strip().lower() in {"帮助", "help", "/帮助", "?", "？"}:
+            event.set_result(
+                MessageEventResult()
+                .message(self._cfg("public_help_text", DEFAULT_PUBLIC_HELP_TEXT))
+                .stop_event()
+            )
+            return
         order_code = parse_order_code(text)
         if not order_code and text.strip().isdigit() and _looks_like_afdian_order_code(text.strip()):
             order_code = text.strip()
@@ -1026,6 +1049,7 @@ class SponsorPassPlugin(Star):
                 f"临时会话：{'开启' if self._cfg('enable_temp_session', True) else '关闭'}\n"
                 f"管理员：{'已配置' if self._admins() else '未读取到'}\n"
                 f"爱发电凭据：{'已配置' if self._sponsor_enabled() else '未完整配置'}\n"
+                f"订单号兑换：{'开启' if self._cfg('enable_order_code', True) else '关闭'}\n"
                 f"状态文件：{'可读写' if state_ok else '写入失败'}\n"
                 f"待处理：{len(self._pending)} 人，已核销订单：{len(self._claimed_orders)} 笔"
             )
