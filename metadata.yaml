@@ -7,7 +7,7 @@ desc: |
   爱发电是默认主流渠道；微信支付和支付宝仅支持官方商户 API，不支持个人收款码自动验单。支持普通赞助、商品订单、订单号兑换、忘填QQ留言兜底、一次性核销、金额阶梯、方案/商品白名单、商品按份有效期、黑名单、限时会员、待审批队列、通知重试、自检和按渠道统计。
 
   自动放行必须经过对应官方 API 精确核验，不接受任意数字、付款截图、用户自述、昵称匹配或本地猜测。异常订单、争议订单和不完整字段会转人工处理。
-version: 1.1.0
+version: 1.1.1
 author: Nevino
 repo: https://github.com/Nevino2333/astrbot_plugin_sponsor_pass
 support_platforms:

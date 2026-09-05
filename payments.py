@@ -89,6 +89,23 @@ def _rsa_sign(private_key_pem: str, message: bytes) -> str:
         raise PaymentInvalid("商户私钥无效") from exc
 
 
+def _rsa_verify(public_key_pem: str, message: bytes, signature_b64: str) -> bool:
+    """使用支付宝公钥验证 RSA2 响应签名；任何失败都返回 False（fail-closed）。"""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+        key.verify(
+            base64.b64decode(signature_b64),
+            message,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
+
+
 @dataclass(slots=True)
 class WechatPayProvider:
     appid: str
@@ -202,6 +219,37 @@ class AlipayProvider:
         params["sign"] = _rsa_sign(self.private_key, sign_content.encode())
         return params
 
+    def _verify_response(self, method: str, raw_text: str, data: dict[str, Any]) -> None:
+        """校验支付宝网关响应的 RSA2 签名；缺失或验签失败一律拒绝。
+
+        支付宝对响应对象原始 JSON 字符串签名（排序键、紧凑分隔符），
+        因此从原始响应文本中精确截取响应对象再验签，避免序列化差异。
+        """
+        response_keys = {
+            "alipay.trade.precreate": "alipay_trade_precreate_response",
+            "alipay.trade.query": "alipay_trade_query_response",
+        }
+        response_key = response_keys.get(method, "")
+        if not response_key:
+            raise PaymentInvalid("不支持的支付宝接口")
+        sign = data.get("sign")
+        if not isinstance(sign, str) or not sign:
+            raise PaymentInvalid("支付宝响应缺少签名")
+        marker = f'"{response_key}":'
+        start_idx = raw_text.find(marker)
+        if start_idx == -1:
+            raise PaymentInvalid("支付宝响应结构异常")
+        body_start = raw_text.find("{", start_idx)
+        sign_idx = raw_text.find('"sign"', body_start)
+        if sign_idx == -1:
+            sign_idx = len(raw_text)
+        body_end = raw_text.rfind("}", body_start, sign_idx)
+        if body_start == -1 or body_end == -1 or body_end <= body_start:
+            raise PaymentInvalid("支付宝响应结构异常")
+        content = raw_text[body_start:body_end + 1]
+        if not _rsa_verify(self.alipay_public_key, content.encode("utf-8"), sign):
+            raise PaymentInvalid("支付宝响应验签失败")
+
     async def _call(self, method: str, biz_content: dict[str, Any]) -> dict[str, Any]:
         if not self.configured:
             raise PaymentServiceError("支付宝商户配置不完整")
@@ -212,7 +260,12 @@ class AlipayProvider:
                 async with session.post(self.gateway, data=params) as response:
                     if response.status >= 500:
                         raise PaymentServiceError(f"支付宝服务异常 HTTP {response.status}")
-                    data = _response_json(await response.json(content_type=None))
+                    raw_text = await response.text()
+                    try:
+                        data = _response_json(json.loads(raw_text))
+                    except (ValueError, TypeError) as exc:
+                        raise PaymentInvalid("支付宝响应格式异常") from exc
+                    self._verify_response(method, raw_text, data)
                     return data
         except PaymentError:
             raise

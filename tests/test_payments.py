@@ -116,6 +116,57 @@ class PaymentTests(unittest.TestCase):
         with self.assertRaises(payments.PaymentInvalid):
             provider._sign("alipay.trade.query", {"out_trade_no": "A1"})
 
+    def _rsa_keypair(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
+        pub_pem = key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        return key, priv_pem, pub_pem
+
+    def test_alipay_response_signature_valid(self):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64 as b64
+        key, priv_pem, pub_pem = self._rsa_keypair()
+        provider = payments.AlipayProvider("app", priv_pem, pub_pem)
+        body = '{"out_trade_no":"A1","trade_status":"TRADE_SUCCESS","buyer_pay_amount":"12.50"}'
+        sign = b64.b64encode(key.sign(body.encode(), padding.PKCS1v15(), hashes.SHA256())).decode()
+        raw = '{"alipay_trade_query_response":' + body + ',"sign":"' + sign + '","sign_type":"RSA2"}'
+        data = {"alipay_trade_query_response": {"out_trade_no": "A1"}, "sign": sign, "sign_type": "RSA2"}
+        # 验签通过不应抛异常
+        provider._verify_response("alipay.trade.query", raw, data)
+
+    def test_alipay_response_signature_tampered(self):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64 as b64
+        key, priv_pem, pub_pem = self._rsa_keypair()
+        provider = payments.AlipayProvider("app", priv_pem, pub_pem)
+        body = '{"out_trade_no":"A1","trade_status":"TRADE_SUCCESS","buyer_pay_amount":"12.50"}'
+        sign = b64.b64encode(key.sign(body.encode(), padding.PKCS1v15(), hashes.SHA256())).decode()
+        # 篡改响应金额，签名不再匹配
+        tampered = '{"out_trade_no":"A1","trade_status":"TRADE_SUCCESS","buyer_pay_amount":"120.00"}'
+        raw = '{"alipay_trade_query_response":' + tampered + ',"sign":"' + sign + '","sign_type":"RSA2"}'
+        data = {"alipay_trade_query_response": {"out_trade_no": "A1"}, "sign": sign, "sign_type": "RSA2"}
+        with self.assertRaises(payments.PaymentInvalid):
+            provider._verify_response("alipay.trade.query", raw, data)
+
+    def test_alipay_response_missing_signature(self):
+        _, priv_pem, pub_pem = self._rsa_keypair()
+        provider = payments.AlipayProvider("app", priv_pem, pub_pem)
+        raw = '{"alipay_trade_query_response":{"out_trade_no":"A1"},"sign_type":"RSA2"}'
+        data = {"alipay_trade_query_response": {"out_trade_no": "A1"}, "sign_type": "RSA2"}
+        with self.assertRaises(payments.PaymentInvalid):
+            provider._verify_response("alipay.trade.query", raw, data)
+
     def test_channel_prefixes_are_unambiguous(self):
         self.assertEqual("wechat", "微信订单号"[:4] and "wechat")
         self.assertNotEqual("wechat:ORDER", "alipay:ORDER")
